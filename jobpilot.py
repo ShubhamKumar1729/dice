@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-JOBPILOT - AI-powered Dice job discovery and controlled application assistant.
+JOBPILOT - Dice job discovery and controlled batch application assistant.
 
 Terminal-only MVP. No database, no web server, no frameworks.
 
@@ -25,6 +25,7 @@ import getpass
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import sys
@@ -41,7 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 APP_NAME = "JOBPILOT"
-APP_TAGLINE = "AI-powered Dice job discovery and controlled application assistant"
+APP_TAGLINE = "Dice job discovery and controlled batch application assistant"
 VERSION = "1.0.0"
 MIN_PYTHON = (3, 9)
 SCHEMA_VERSION = 1
@@ -49,6 +50,44 @@ SCHEMA_VERSION = 1
 DICE_DOMAIN = "dice.com"
 DICE_LOGIN_URL = "https://www.dice.com/dashboard/login"
 DICE_SEARCH_URL = "https://www.dice.com/jobs"
+
+# Dice hosts its own Easy Apply flow at /job-applications/{jobId}/wizard.
+# Verified against the live site: the "Apply Now" button on a job-detail page
+# links to /dashboard/login?redirectUrl=%2Fjob-applications%2F{id}%2Fwizard,
+# so the wizard path is the authoritative signal that Dice (not the employer's
+# own site) owns the application form.
+DICE_WIZARD_PATH = "/job-applications/"
+DICE_WIZARD_URL = "https://www.dice.com/job-applications/{job_id}/wizard"
+
+
+def dice_wizard_url(job_id: str) -> str:
+    """Direct URL of Dice's hosted Easy Apply wizard for a job id."""
+    return DICE_WIZARD_URL.format(job_id=(job_id or "").strip())
+
+
+DICE_WIZARD_RE = re.compile(r"/job-applications/([A-Za-z0-9._\-]+)/wizard", re.I)
+
+
+def dice_wizard_job_id(apply_url: str) -> str:
+    """Pull the job id out of a Dice Easy Apply wizard link.
+
+    Handles both the signed-out form
+    (``/dashboard/login?redirectUrl=%2Fjob-applications%2F{id}%2Fwizard``) and the
+    signed-in form (``/job-applications/{id}/wizard``). Returns "" when the link
+    is not a Dice-hosted wizard, so callers never guess.
+    """
+    if not apply_url:
+        return ""
+    try:
+        from urllib.parse import unquote
+        decoded = unquote(apply_url)
+    except Exception:                                       # pragma: no cover
+        decoded = apply_url
+    for candidate in (decoded, apply_url):
+        match = DICE_WIZARD_RE.search(candidate or "")
+        if match:
+            return match.group(1)
+    return ""
 
 # ---------------------------------------------------------------------------
 # Optional dependencies (imported defensively so that nothing ever crashes)
@@ -63,15 +102,6 @@ try:
     from dotenv import load_dotenv
 except Exception:                                             # pragma: no cover
     load_dotenv = None                                         # type: ignore
-
-try:
-    from pydantic import BaseModel, Field, ValidationError
-    HAVE_PYDANTIC = True
-except Exception:                                             # pragma: no cover
-    HAVE_PYDANTIC = False
-    BaseModel = object                                         # type: ignore
-    Field = None                                               # type: ignore
-    ValidationError = Exception                                # type: ignore
 
 try:
     from rich.console import Console
@@ -158,7 +188,8 @@ CHALLENGE_HINTS = (
     "please verify your identity", "bot detection", "automated access",
 )
 
-# Sensitive / legally consequential questions -> never decided by the AI.
+# Sensitive / legally consequential questions -> only from your own stored profile
+# value, or asked of you. Never inferred, never auto-filled.
 SENSITIVE_PATTERNS = (
     ("work_authorization", r"authoriz(ed|ation)\s+to\s+work|work\s+authoriz|legally\s+authoriz|"
                           r"eligible\s+to\s+work|right\s+to\s+work|work\s+permit|employment\s+eligib"),
@@ -611,16 +642,18 @@ class Config:
     dice_allow_browser_search: bool = False
     dice_max_results: int = 25
     dice_enrich_limit: int = 10
-    llm_api_key: str = ""
-    llm_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4o-mini"
-    llm_enabled: bool = True
-    ai_min_confidence: float = 0.75
     headless: bool = False
     request_timeout: int = 30
     nav_timeout: int = 45
     pol_request_delay: float = 1.5
-    max_applications_per_run: int = 1
+    max_applications_per_run: int = 30
+    # Batch apply (menu 5 -> 2): how many jobs per run, the pause between them,
+    # and whether one typed YES covers the whole batch.
+    batch_size: int = 25
+    batch_delay_seconds: float = 45.0
+    batch_confirm: bool = True
+    batch_stop_after_failures: int = 3
+    max_wizard_steps: int = 8
     demo: bool = False
 
     @property
@@ -630,10 +663,6 @@ class Config:
     @property
     def dice_browser_ready(self) -> bool:
         return self.dice_allow_browser_search and HAVE_PLAYWRIGHT
-
-    @property
-    def ai_ready(self) -> bool:
-        return bool(self.llm_enabled and self.llm_api_key and requests is not None)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -678,16 +707,16 @@ def load_config(demo: bool = False) -> Config:
         dice_allow_browser_search=_env_bool("DICE_ALLOW_BROWSER_SEARCH", False),
         dice_max_results=_env_int("DICE_MAX_RESULTS", 25),
         dice_enrich_limit=_env_int("DICE_ENRICH_LIMIT", 10),
-        llm_api_key=os.environ.get("LLM_API_KEY", "").strip(),
-        llm_base_url=os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/"),
-        llm_model=os.environ.get("LLM_MODEL", "gpt-4o-mini").strip(),
-        llm_enabled=_env_bool("LLM_ENABLED", True),
-        ai_min_confidence=_env_float("AI_MIN_CONFIDENCE", 0.75),
         headless=_env_bool("BROWSER_HEADLESS", False),
         request_timeout=_env_int("REQUEST_TIMEOUT", 30),
         nav_timeout=_env_int("NAV_TIMEOUT", 45),
         pol_request_delay=_env_float("POLITE_DELAY_SECONDS", 1.5),
-        max_applications_per_run=_env_int("MAX_APPLICATIONS_PER_RUN", 1),
+        max_applications_per_run=_env_int("MAX_APPLICATIONS_PER_RUN", 30),
+        batch_size=_env_int("BATCH_SIZE", 25),
+        batch_delay_seconds=_env_float("BATCH_DELAY_SECONDS", 45.0),
+        batch_confirm=_env_bool("BATCH_REQUIRE_CONFIRMATION", True),
+        batch_stop_after_failures=_env_int("BATCH_STOP_AFTER_FAILURES", 3),
+        max_wizard_steps=_env_int("MAX_WIZARD_STEPS", 8),
         demo=demo,
     )
     if config.dice_search_path and not config.dice_search_path.startswith("/"):
@@ -730,7 +759,7 @@ def update_env_file(updates: Dict[str, str]) -> bool:
 def _pkg_status() -> List[Tuple[str, bool, str]]:
     result: List[Tuple[str, bool, str]] = []
     for module, name in (("rich", "rich"), ("requests", "requests"), ("dotenv", "python-dotenv"),
-                         ("pydantic", "pydantic"), ("pypdf", "pypdf"), ("docx", "python-docx")):
+                         ("pypdf", "pypdf"), ("docx", "python-docx")):
         try:
             __import__(module)
             result.append((name, True, ""))
@@ -836,9 +865,6 @@ def environment_report(config: Config, deep: bool = False) -> bool:
          "official Dice partner API search" if config.dice_api_ready else "required for Dice API search"],
         ["DICE_ALLOW_BROWSER_SEARCH", "on" if config.dice_allow_browser_search else "off",
          "search the public Dice site in a real browser" if config.dice_allow_browser_search else "-"],
-        ["LLM_API_KEY", "set" if config.llm_api_key else "not set",
-         "semantic matching + question understanding" if config.llm_api_key else "optional (AI features stay off)"],
-        ["LLM_MODEL", config.llm_model, "AI model name"],
         ["BROWSER_HEADLESS", "on" if config.headless else "off", "apply flow is easier to follow with this off"],
     ]
     UI.table(["Config", "Value", "Meaning"], config_rows)
@@ -847,9 +873,6 @@ def environment_report(config: Config, deep: bool = False) -> bool:
         UI.warn("No Dice integration is configured, so job search cannot work.")
         UI.print("    Set DICE_API_KEY (official Dice partner API), or set")
         UI.print("    DICE_ALLOW_BROWSER_SEARCH=true to search the public Dice site in a browser.")
-    if not config.llm_api_key:
-        UI.info("No LLM_API_KEY: AI matching and AI question support are disabled. "
-                "Everything else still works; unresolved questions go to you.")
 
     UI.rule("Folders")
     ensure_dirs()
@@ -878,6 +901,13 @@ CANDIDATE_DEFAULTS: Dict[str, Any] = {
     "work_authorization": "", "sponsorship_required": "", "work_modes": [],
     "employment_type": "FULLTIME",
     "resume_file": "",
+    # Batch-apply memory: answers you typed once are reused on every later job,
+    # so a 25-job run does not ask you the same question 25 times.
+    # Normalised question text -> {"answer": str, "source": str, "at": iso}
+    "answer_bank": {},
+    # Stored free-text answer used for "Why are you a good fit?" / cover-letter
+    # style boxes. Written by you once; never generated.
+    "pitch": "",
     # Optional self-identification data. Only used if the user explicitly provides it.
     "veteran_status": "", "disability_status": "", "gender": "", "race": "",
     "updated_at": "",
@@ -894,7 +924,63 @@ def load_candidate() -> Dict[str, Any]:
     for key in ("target_roles", "skills", "certifications", "work_experience", "projects", "work_modes"):
         if not isinstance(candidate.get(key), list):
             candidate[key] = []
+    if not isinstance(candidate.get("answer_bank"), dict):
+        candidate["answer_bank"] = {}
     return candidate
+
+
+def answer_bank_key(question: str) -> str:
+    """Stable key for a question, so the same question on job 17 reuses job 1's answer."""
+    text = re.sub(r"[^a-z0-9]+", " ", (question or "").lower()).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:160]
+
+
+def bank_entry(candidate: Dict[str, Any], question: str) -> Optional[Dict[str, Any]]:
+    """The stored answer-bank record for a question, or None."""
+    bank = candidate.get("answer_bank")
+    if not isinstance(bank, dict):
+        return None
+    entry = bank.get(answer_bank_key(question))
+    if isinstance(entry, dict):
+        return entry
+    if entry:
+        return {"answer": str(entry)}
+    return None
+
+
+def bank_lookup(candidate: Dict[str, Any], question: str) -> str:
+    """Return a previously saved answer for this question, or ""."""
+    entry = bank_entry(candidate, question)
+    return str((entry or {}).get("answer", "") or "")
+
+
+def bank_store(candidate: Dict[str, Any], question: str, answer: str, source: str) -> bool:
+    """Remember an answer you gave, for reuse across the rest of the batch."""
+    key = answer_bank_key(question)
+    if not key or not str(answer or "").strip():
+        return False
+    if not isinstance(candidate.get("answer_bank"), dict):
+        candidate["answer_bank"] = {}
+    candidate["answer_bank"][key] = {"answer": str(answer), "source": source, "at": now_iso()}
+    return save_candidate(candidate)
+
+
+def bank_decline(candidate: Dict[str, Any], question: str) -> bool:
+    """Remember that you chose to leave a question empty.
+
+    Without this, a 25-job batch asks the same unanswered question 25 times.
+    Declining once means "leave it empty everywhere", and the job then stops at
+    REVIEW_REQUIRED if the field turns out to be required - it is never guessed.
+    """
+    key = answer_bank_key(question)
+    if not key:
+        return False
+    if not isinstance(candidate.get("answer_bank"), dict):
+        candidate["answer_bank"] = {}
+    candidate["answer_bank"][key] = {"answer": "", "declined": True,
+                                     "source": "human", "at": now_iso()}
+    return save_candidate(candidate)
 
 
 def candidate_has_profile(candidate: Dict[str, Any]) -> bool:
@@ -909,7 +995,7 @@ def save_candidate(candidate: Dict[str, Any]) -> bool:
 
 
 def candidate_facts(candidate: Dict[str, Any], limit: int = 60) -> str:
-    """Plain-text fact sheet handed to the AI / shown in reviews. Only real data."""
+    """Plain-text fact sheet shown in reviews and used for matching. Only real data."""
     lines = []
     name = f"{candidate.get('first_name','')} {candidate.get('last_name','')}".strip()
     pairs = [("Name", name), ("Email", candidate.get("email")), ("Phone", candidate.get("phone")),
@@ -1257,6 +1343,30 @@ class ProviderError(Exception):
     """Raised with a human-readable explanation (never a stack trace)."""
 
 
+# Dice renders employment wording several ways ("Full-time", "Contract W2",
+# "Third Party", "FULL_TIME" from schema.org). The scoring engine compares these
+# against the candidate's preference, so they are canonicalised once, here.
+EMPLOYMENT_TYPE_PATTERNS = [
+    (r"\bfull time\b", "FULLTIME"),
+    (r"\bpart time\b", "PARTTIME"),
+    (r"\bcontract\b|\bc2c\b|\bw2\b", "CONTRACT"),
+    (r"\bthird party\b", "THIRD_PARTY"),
+    (r"\bintern\b|\binternship\b", "INTERN"),
+]
+
+
+def normalize_employment_type(text: str) -> str:
+    """Map employment wording onto canonical tokens. Returns "" when unrecognised."""
+    low = re.sub(r"[_\-\s]+", " ", str(text or "").lower()).strip()
+    if not low:
+        return ""
+    found: List[str] = []
+    for pattern, token in EMPLOYMENT_TYPE_PATTERNS:
+        if re.search(pattern, low) and token not in found:
+            found.append(token)
+    return ", ".join(found)
+
+
 def normalize_job(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Canonical job record - only fields actually supplied are filled in."""
     job = {
@@ -1279,6 +1389,9 @@ def normalize_job(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
     if not job["id"]:
         job["id"] = "dice-" + short_hash(job["source_url"] or job["title"] + job["company"])
+    canonical_employment = normalize_employment_type(job["employment_type"])
+    if canonical_employment:
+        job["employment_type"] = canonical_employment
     return job
 
 
@@ -1520,18 +1633,22 @@ class DiceProvider:
                         "employment_type": card.get("employment_type", ""),
                         "application_url": card["url"],
                         "source_url": card["url"],
-                        "application_type": AT_UNKNOWN,
+                        "application_type": card.get("application_type") or AT_UNKNOWN,
                         "source": "dice-site",
                     })
                     jobs.append(job)
-                    if index < limit:
-                        time.sleep(max(0.0, self.config.pol_request_delay))
 
+                # Enrichment opens one real page per job, so spend that budget on
+                # the jobs this tool can actually act on (Dice Easy Apply) first.
+                # The sort is stable, so Dice's own ordering is preserved inside
+                # each group.
+                jobs.sort(key=lambda item: 0 if item.get("application_type") == AT_EASY_APPLY else 1)
                 enrich = min(self.config.dice_enrich_limit, len(jobs))
                 for index, job in enumerate(jobs[:enrich], start=1):
                     UI.info(f"Reading job details {index}/{enrich}: {job['title'][:60]}")
                     self._enrich_from_site(page, job)
-                    time.sleep(max(0.0, self.config.pol_request_delay))
+                    if index < enrich:
+                        time.sleep(max(0.0, self.config.pol_request_delay))
                 browser.close()
         except ProviderError:
             raise
@@ -1603,6 +1720,12 @@ class DiceProvider:
                 "workplace_type": workplace,
                 "salary": salary_match.group(0) if salary_match else "",
                 "posted_date": posted,
+                # Dice renders an "Easy Apply" badge on the search-result card
+                # itself, so the apply type is known without opening the job.
+                "application_type": (AT_EASY_APPLY
+                                     if re.search(r"\beasy\s+apply\b", card_text, re.I)
+                                     else AT_UNKNOWN),
+                "employment_type": normalize_employment_type(card_text),
             })
         return [card for card in results if card["url"] and card["title"]]
 
@@ -1625,7 +1748,7 @@ class DiceProvider:
         try:
             data = page.evaluate(r"""
             () => {
-              const out = { json: null, apply: null, text: '' };
+              const out = { json: null, apply: null, apply_href: '', text: '' };
               const nodes = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
               for (const n of nodes) {
                 try {
@@ -1640,10 +1763,16 @@ class DiceProvider:
                 } catch (e) { /* ignore malformed block */ }
                 if (out.json) break;
               }
-              const buttons = Array.from(document.querySelectorAll('button, a[role="button"], a[data-testid*="apply" i]'));
+              const buttons = Array.from(document.querySelectorAll(
+                'button, a[role="button"], a[data-testid*="apply" i], a[href*="job-applications"], a[href*="apply" i]'
+              ));
               for (const b of buttons) {
                 const label = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim();
-                if (/apply/i.test(label) && label.length < 60) { out.apply = label; break; }
+                const href = b.href || (b.getAttribute ? (b.getAttribute('href') || '') : '');
+                // Dice's hosted Easy Apply wizard link wins even when the label
+                // is a generic "Apply Now".
+                if (/job-applications/i.test(href)) { out.apply = label || 'Apply Now'; out.apply_href = href; break; }
+                if (/apply/i.test(label) && label.length < 60) { out.apply = label; out.apply_href = href; break; }
               }
               out.text = (document.body ? document.body.innerText : '').slice(0, 6000);
               return out;
@@ -1700,8 +1829,16 @@ class DiceProvider:
             job["requirements"] = extract_requirements(job["description"])
 
         apply_label = (data.get("apply") or "").strip()
+        apply_href = (data.get("apply_href") or "").strip()
         body = (data.get("text") or "").lower()
-        job["application_type"] = classify_apply_label(apply_label, body)
+        job["application_type"] = classify_apply_label(apply_label, body, apply_href)
+        # When Dice owns the form, remember the direct wizard URL: the apply flow
+        # can deep-link there instead of re-reading the job-detail page.
+        wizard_id = dice_wizard_job_id(apply_href)
+        if wizard_id:
+            job["application_url"] = dice_wizard_url(wizard_id)
+            if job.get("application_type") == AT_UNKNOWN:
+                job["application_type"] = AT_EASY_APPLY
         job["retrieved_at"] = now_iso()
 
 
@@ -1766,21 +1903,56 @@ def extract_requirements(description: str) -> str:
     return ""
 
 
-def classify_apply_label(label: str, page_text: str = "") -> str:
-    """Classify how a Dice job is applied to. Never guesses positively."""
+def classify_apply_label(label: str, page_text: str = "", apply_url: str = "") -> str:
+    """Classify how a Dice job is applied to. Never guesses positively.
+
+    ``apply_url`` is the href of the apply control. On Dice this is the strongest
+    signal available: an Easy Apply job links to Dice's own hosted wizard at
+    /job-applications/{id}/wizard, while an external job leaves dice.com.
+
+    NOTE: the live Dice button label for an Easy Apply job is "Apply Now". An
+    earlier version of this function treated "apply now" as proof of an external
+    application, which misclassified every Dice Easy Apply job and made menu 5
+    refuse to run. A generic label with no URL evidence is now UNKNOWN, which
+    the caller resolves by inspecting the page.
+    """
     label_low = (label or "").lower()
+
+    # 1. Dice says so explicitly.
     if "easy apply" in label_low:
         return AT_EASY_APPLY
-    if label_low:
-        if any(token in label_low for token in ("company site", "company website", "external",
-                                                "apply now", "apply on", "apply externally")):
+
+    # 2. The href points at Dice's own hosted application wizard. The real link
+    #    is percent-encoded (/dashboard/login?redirectUrl=%2Fjob-applications%2F
+    #    {id}%2Fwizard), so it must be decoded before matching.
+    if apply_url:
+        try:
+            from urllib.parse import unquote
+            decoded = unquote(apply_url)
+        except Exception:                                   # pragma: no cover
+            decoded = apply_url
+        decoded_low = decoded.lower()
+        if DICE_WIZARD_PATH in decoded_low:
+            return AT_EASY_APPLY
+        if re.search(r"https?://", decoded_low) and DICE_DOMAIN not in decoded_low:
             return AT_EXTERNAL
+
+    # 3. Explicit off-site wording on the control itself.
+    if label_low and any(token in label_low for token in
+                         ("company site", "company website", "apply externally",
+                          "external", "apply on")):
+        return AT_EXTERNAL
+
+    # 4. Page-level evidence.
     text = (page_text or "").lower()
-    if "easy apply" in text:
-        return AT_EASY_APPLY
     if "apply on company site" in text or "apply on company website" in text:
         return AT_EXTERNAL
+    if "easy apply" in text:
+        return AT_EASY_APPLY
+
+    # 5. A bare "Apply" / "Apply Now" with no href tells us nothing honest.
     return AT_UNKNOWN
+
 
 # ===========================================================================
 # SECTION 9 - job storage
@@ -1930,7 +2102,7 @@ def store_answer(app_id: str, question: str, answer: str, source: str,
             return
 
 # ===========================================================================
-# SECTION 11 - deterministic match scoring (AI can only adjust, never decide)
+# SECTION 11 - deterministic match scoring (no model involved)
 # ===========================================================================
 
 
@@ -1964,7 +2136,7 @@ def recommendation_for(score: int) -> str:
 
 
 def score_job(job: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
-    """Explainable, deterministic score. Weights per the spec; AI may only nudge it."""
+    """Explainable, deterministic score. Same formula for everyone, no model involved."""
     breakdown: Dict[str, float] = {}
     matches: List[str] = []
     gaps: List[str] = []
@@ -2103,8 +2275,9 @@ def score_job(job: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
         gaps.append("Job mentions a security clearance you have not listed")
     breakdown["other"] = round(WEIGHTS["other"] * other, 1)
 
-    total = round(sum(breakdown.values()))
-    total = max(0, min(100, total))
+    # Half-up, not Python's banker's rounding: a sum of 92.5 is a 93, not a 92.
+    exact = round(sum(float(value) for value in breakdown.values()), 1)
+    total = max(0, min(100, int(exact + 0.5)))
     recommendation = recommendation_for(total)
     return {
         "score": total,
@@ -2112,225 +2285,8 @@ def score_job(job: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
         "matches": matches[:12],
         "gaps": gaps[:12],
         "recommendation": recommendation,
-        "ai_adjustment": 0,
-        "ai_reason": "",
     }
 
-
-def apply_ai_adjustment(result: Dict[str, Any], adjustment: int, confidence: float,
-                        reason: str) -> Dict[str, Any]:
-    """Apply a validated AI nudge. Bounded, clamped, and always recorded."""
-    try:
-        adjustment = int(adjustment)
-    except (TypeError, ValueError):
-        return result
-    adjustment = max(-10, min(10, adjustment))
-    result["ai_adjustment"] = adjustment
-    result["ai_reason"] = clean_text(reason, 400)
-    result["score"] = max(0, min(100, result["score"] + adjustment))
-    result["breakdown"]["ai_adjustment"] = adjustment
-    result["recommendation"] = recommendation_for(result["score"])
-    return result
-
-
-if HAVE_PYDANTIC:
-    class AIQuestionAnswer(BaseModel):                       # type: ignore[misc]
-        answer: str = Field(default="")
-        confidence: float = Field(default=0.0)
-        reason: str = Field(default="")
-
-    class AIMatchVerdict(BaseModel):                         # type: ignore[misc]
-        adjustment: int = Field(default=0)
-        confidence: float = Field(default=0.0)
-        reason: str = Field(default="")
-else:                                                        # pragma: no cover
-    AIQuestionAnswer = None                                  # type: ignore
-    AIMatchVerdict = None                                    # type: ignore
-
-
-class AIClient:
-    """Thin, defensive wrapper. Returns None on any problem - the caller then
-    falls back to asking the human. Never controls the browser."""
-
-    def __init__(self, config: Config):
-        self.config = config
-        self.last_error = ""
-
-    @property
-    def available(self) -> bool:
-        return self.config.ai_ready
-
-    def _post(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        url = self.config.llm_base_url + "/chat/completions"
-        headers = {"Authorization": f"Bearer {self.config.llm_api_key}",
-                   "Content-Type": "application/json", "User-Agent": f"{APP_NAME}/{VERSION}"}
-        for attempt in (0, 1):
-            try:
-                response = requests.post(url, headers=headers, json=payload,
-                                         timeout=self.config.request_timeout * 2)
-            except Exception as exc:
-                self.last_error = f"AI request failed: {first_line(str(exc), 160)}"
-                log_event("ai_request", "error", error=self.last_error)
-                return None
-            if response.status_code in (400, 422) and attempt == 0 and "response_format" in payload:
-                payload = dict(payload)
-                payload.pop("response_format", None)
-                continue
-            if response.status_code in (401, 403):
-                self.last_error = "AI provider rejected the API key (HTTP %d)." % response.status_code
-            elif response.status_code == 429:
-                self.last_error = "AI provider rate limit reached (HTTP 429)."
-            elif response.status_code >= 400:
-                self.last_error = f"AI provider error HTTP {response.status_code}: {first_line(response.text, 160)}"
-            else:
-                try:
-                    data = response.json()
-                    content = data["choices"][0]["message"]["content"]
-                except Exception:
-                    self.last_error = "AI provider returned an unexpected response shape."
-                    log_event("ai_request", "error", error=self.last_error)
-                    return None
-                if isinstance(content, list):     # some providers return content parts
-                    content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
-                try:
-                    parsed = json.loads(content)
-                except Exception:
-                    match = re.search(r"\{.*\}", content or "", re.S)
-                    if not match:
-                        self.last_error = "AI output was not valid JSON."
-                        log_event("ai_invalid_json", "error", error=self.last_error)
-                        return None
-                    try:
-                        parsed = json.loads(match.group(0))
-                    except Exception:
-                        self.last_error = "AI output was not valid JSON."
-                        log_event("ai_invalid_json", "error", error=self.last_error)
-                        return None
-                if not isinstance(parsed, dict):
-                    self.last_error = "AI output was not a JSON object."
-                    return None
-                log_event("ai_request", "ok")
-                return parsed
-            log_event("ai_request", "error", error=self.last_error)
-            return None
-        return None
-
-    def semantic_match(self, job: Dict[str, Any], candidate: Dict[str, Any],
-                       base: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Ask the AI for a small bounded score adjustment (-10..+10)."""
-        if not self.available:
-            return None
-        facts = candidate_facts(candidate)
-        prompt = (
-            "You adjust a deterministic job-match score by at most -10 to +10 points.\n"
-            "Rules:\n"
-            "- Judge only semantic closeness between the candidate facts and this job.\n"
-            "- Never invent facts about the candidate.\n"
-            "- Output JSON only: {\"adjustment\": int, \"confidence\": 0-1, \"reason\": str}.\n"
-            "- adjustment must be between -10 and 10. Use 0 if unsure.\n\n"
-            f"CANDIDATE FACTS\n{facts}\n\n"
-            f"JOB\nTitle: {job.get('title','')}\nCompany: {job.get('company','')}\n"
-            f"Location: {job.get('location','')}\nWorkplace: {job.get('workplace_type','')}\n"
-            f"Employment type: {job.get('employment_type','')}\n"
-            f"Description: {clean_text(job.get('description',''), 3000)}\n\n"
-            f"CURRENT DETERMINISTIC RESULT\nScore {base.get('score')} "
-            f"(recommendation {base.get('recommendation')}), matches: "
-            f"{'; '.join(base.get('matches', [])[:6]) or 'none'}, gaps: "
-            f"{'; '.join(base.get('gaps', [])[:6]) or 'none'}\n"
-        )
-        parsed = self._post(self._payload(prompt))
-        if not parsed:
-            return None
-        try:
-            if HAVE_PYDANTIC:
-                verdict = AIMatchVerdict(**parsed)
-            else:
-                verdict = AIMatchVerdict
-                verdict.adjustment = int(parsed.get("adjustment", 0) or 0)
-                verdict.confidence = float(parsed.get("confidence", 0) or 0)
-                verdict.reason = str(parsed.get("reason", ""))[:400]
-        except Exception as exc:
-            self.last_error = f"AI output failed validation: {first_line(str(exc), 160)}"
-            log_event("ai_invalid_output", "error", error=self.last_error)
-            return None
-        if not isinstance(verdict.adjustment, int):
-            return None
-        if verdict.confidence < 0.5:
-            self.last_error = "AI was not confident enough to adjust the score."
-            return None
-        return {"adjustment": max(-10, min(10, verdict.adjustment)),
-                "confidence": float(verdict.confidence),
-                "reason": clean_text(verdict.reason, 400)}
-
-    def answer_question(self, question: str, options: List[str], candidate: Dict[str, Any],
-                        job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Answer one application question using ONLY known candidate facts."""
-        if not self.available:
-            return None
-        facts = candidate_facts(candidate)
-        option_block = "\n".join(f"- {option}" for option in options) if options else "(no fixed options)"
-        prompt = (
-            "You answer ONE job-application question using ONLY the candidate facts below.\n"
-            "Rules:\n"
-            "- If the facts do not contain the information, answer with answer=\"UNKNOWN\".\n"
-            "- Never invent or assume anything about the candidate.\n"
-            "- If options are given, the answer must be exactly one of them.\n"
-            "- Output JSON only: {\"answer\": str, \"confidence\": 0-1, \"reason\": str}\n\n"
-            f"CANDIDATE FACTS\n{facts}\n\n"
-            f"JOB CONTEXT\nTitle: {job.get('title','')}\nCompany: {job.get('company','')}\n\n"
-            f"QUESTION\n{question}\n\n"
-            f"AVAILABLE OPTIONS\n{option_block}\n"
-        )
-        parsed = self._post(self._payload(prompt))
-        if not parsed:
-            return None
-        try:
-            if HAVE_PYDANTIC:
-                answer = AIQuestionAnswer(**parsed)
-            else:                                            # pragma: no cover
-                answer = AIQuestionAnswer
-                answer.answer = str(parsed.get("answer", ""))[:500]
-                answer.confidence = float(parsed.get("confidence", 0) or 0)
-                answer.reason = str(parsed.get("reason", ""))[:400]
-        except Exception as exc:
-            self.last_error = f"AI output failed validation: {first_line(str(exc), 160)}"
-            log_event("ai_invalid_output", "error", error=self.last_error)
-            return None
-        text = (answer.answer or "").strip()
-        if not text or text.upper() in ("UNKNOWN", "N/A", "NONE", "NULL"):
-            self.last_error = "AI reported that the candidate facts do not contain this information."
-            return None
-        if options:
-            exact = next((option for option in options if option.strip().lower() == text.lower()), None)
-            if exact is None:
-                partial = [option for option in options if text.lower() in option.lower()
-                           or option.lower() in text.lower()]
-                if len(partial) != 1:
-                    self.last_error = ("AI answer did not match any available option; "
-                                       "human input required.")
-                    log_event("ai_unmapped_answer", "warn", error=self.last_error)
-                    return None
-                text = partial[0]
-            else:
-                text = exact
-        if answer.confidence < self.config.ai_min_confidence:
-            self.last_error = (f"AI confidence {answer.confidence:.2f} is below the "
-                               f"{self.config.ai_min_confidence:.2f} threshold.")
-            return None
-        return {"answer": text, "confidence": float(answer.confidence),
-                "reason": clean_text(answer.reason, 400)}
-
-    def _payload(self, user_prompt: str) -> Dict[str, Any]:
-        return {
-            "model": self.config.llm_model,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": "You return strict JSON only. You never invent "
-                                              "candidate data and you never take actions."},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
 
 # ===========================================================================
 # SECTION 13 - Playwright helpers (browser, screenshots, challenge detection)
@@ -2407,7 +2363,7 @@ def challenge_stop(job: Dict[str, Any], app_id: Optional[str], where: str) -> No
     if app_id:
         set_state(app_id, ST_REVIEW, error=f"Security challenge detected ({where}). "
                                            "Human intervention required.",
-                  flags=["HUMAN_REVIEW_REQUIRED"])
+                  flags=["HUMAN_REVIEW_REQUIRED", "SECURITY_CHALLENGE"])
     log_event("security_challenge", "blocked", job_id=job.get("id"), application_id=app_id,
               error=where)
 
@@ -2571,7 +2527,12 @@ KNOWN_FIELD_PATTERNS: List[Tuple[str, str]] = [
     ("github", r"github"),
     ("portfolio", r"\bportfolio\b|personal website|\bwebsite\b|personal site"),
     ("resume", r"\bresume\b|\bcv\b|curriculum vitae|upload.*(resume|cv|file)|attach"),
-    ("years_experience", r"years? of experience|years? experience|experience in years|total experience"),
+    # Only phrasings that unambiguously ask for a NUMBER of years. "Describe your
+    # professional experience" is deliberately not matched: filling a free-text box
+    # with "6" would be as wrong as leaving it blank.
+    ("years_experience", r"years? of experience|years? experience|experience in years|"
+                         r"total experience|total years?|"
+                         r"years? of (professional|relevant|related|overall|work|it) experience"),
     ("salary_expectation", r"expected (salary|compensation|pay|rate)|desired (salary|compensation|pay|rate)|salary expectation"),
     ("cover_letter", r"cover letter|message to|anything else|additional information|why do you want"),
     ("education", r"\beducation\b|highest (degree|education)|degree"),
@@ -2580,9 +2541,35 @@ KNOWN_FIELD_PATTERNS: List[Tuple[str, str]] = [
 ]
 
 
+# Longest first, so "react native" wins over "react" and "spring boot" over "spring".
+SKILL_VOCAB_BY_LENGTH = sorted(SKILL_VOCAB, key=len, reverse=True)
+
+
+def named_technology(text: str) -> Optional[str]:
+    """The first specific technology named in a question, or None.
+
+    This only reads the question; it never adds a skill to your profile.
+    """
+    for token in SKILL_VOCAB_BY_LENGTH:
+        if contains_word(text, token):
+            return token
+    return None
+
+
 def match_known_field(text: str) -> Optional[str]:
     for key, pattern in KNOWN_FIELD_PATTERNS:
         if re.search(pattern, text, re.I):
+            if key == "years_experience":
+                technology = named_technology(text)
+                if technology:
+                    # "How many years of experience do you have with Kubernetes?" is NOT
+                    # the same question as "How many years of experience do you have?".
+                    # Filling it with your TOTAL years would state something false to an
+                    # employer, so it is deliberately left unmatched: you answer it (once),
+                    # and the answer bank reuses your answer on the rest of the batch.
+                    log_event("field_mapping", "warn",
+                              error=f"'{text[:70]}' names '{technology}': not filled from total years")
+                    return None
             return key
     return None
 
@@ -2608,6 +2595,8 @@ def deterministic_value(key: str, candidate: Dict[str, Any]) -> str:
                              else str(candidate.get("years_experience"))),
         "education": candidate.get("education", ""),
         "resume": candidate.get("resume_file", ""),
+        # "Why are you a good fit?" / cover-letter boxes: text you wrote once.
+        "cover_letter": candidate.get("pitch", ""),
     }
     if key == "full_name":
         return " ".join(part for part in [candidate.get("first_name", ""),
@@ -2704,13 +2693,14 @@ class PlannedField:
     question: str
     kind: str
     value: str = ""
-    source: str = ""            # profile | profile:sensitive | profile:resume | ai | human | missing
+    source: str = ""            # profile | profile:sensitive | profile:resume | bank | human | missing
     confidence: Optional[float] = None
     reason: str = ""
     sensitive: Optional[str] = None
     options: List[str] = field(default_factory=list)
     hint: str = ""
     resolved: bool = False
+    declined: bool = False      # you chose to leave this empty; do not ask again
 
     @property
     def display_value(self) -> str:
@@ -2857,12 +2847,29 @@ def build_planned_fields(controls: List[Dict[str, Any]], candidate: Dict[str, An
     return planned, problems
 
 
-def ask_human_for_field(item: PlannedField) -> None:
+def _record_skip(item: PlannedField, candidate: Optional[Dict[str, Any]], explicit: bool) -> None:
+    """Remember a question you chose to leave empty - but only if you really chose it.
+
+    An exhausted stdin (piped input, closed terminal) also comes back as an empty
+    answer. Banking that would permanently mark every remaining question as
+    "declined" because of a transient condition, so it is refused instead.
+    """
+    if candidate is None:
+        return
+    if not explicit and UI.eof_seen:
+        item.reason = "input exhausted"
+        UI.warn("No input available - the question was left empty and NOT saved as a decline.")
+        log_event("answer_bank", "warn", error="empty answer ignored: input exhausted")
+        return
+    bank_decline(candidate, item.question)
+
+
+def ask_human_for_field(item: PlannedField, candidate: Optional[Dict[str, Any]] = None) -> None:
+    """Ask you one question. What you type is saved for the rest of the batch."""
     UI.print("")
     UI.warn(f"Unresolved question: {item.question}")
     if item.sensitive:
-        UI.print(f"    Sensitive/legal question ({item.sensitive.replace('_', ' ')}). "
-                 "The AI is never allowed to answer it.")
+        UI.print(f"    Sensitive/legal question ({item.sensitive.replace('_', ' ')}).")
     if item.hint:
         UI.print(f"    Your profile says: {item.hint}")
     if item.options:
@@ -2873,49 +2880,88 @@ def ask_human_for_field(item: PlannedField) -> None:
                          allow_empty=True)
             if raw.lower() in ("skip", ""):
                 item.value, item.source, item.resolved = "", "missing", False
+                _record_skip(item, candidate, explicit=raw.lower() == "skip")
                 return
             if raw.isdigit() and 1 <= int(raw) <= len(item.options):
                 item.value, item.source, item.resolved = item.options[int(raw) - 1], "human", True
-                return
+                break
             exact = next((option for option in item.options if option.lower() == raw.lower()), None)
             if exact:
                 item.value, item.source, item.resolved = exact, "human", True
-                return
+                break
             UI.warn("Please pick one of the listed options (or type skip).")
     else:
         raw = UI.ask("Your answer (or 'skip' to leave it empty)", allow_empty=True)
         if raw.lower() == "skip" or raw == "":
             item.value, item.source, item.resolved = "", "missing", False
-        else:
-            item.value, item.source, item.resolved = raw, "human", True
+            _record_skip(item, candidate, explicit=raw.lower() == "skip")
+            return
+        item.value, item.source, item.resolved = raw, "human", True
+    if candidate is not None and item.resolved:
+        bank_store(candidate, item.question, item.value, "human")
+
+
+def _apply_banked_answer(item: PlannedField, candidate: Dict[str, Any]) -> bool:
+    """Reuse an answer you typed on an earlier job. Only when it still fits.
+
+    For option-based controls the banked text must map onto one of the options
+    actually present on this page; otherwise it is ignored and you are asked.
+    A question you declined earlier stays empty and is not asked again.
+    """
+    entry = bank_entry(candidate, item.question)
+    if not entry:
+        return False
+    if entry.get("declined"):
+        item.value = ""
+        item.source = "missing"
+        item.resolved = False
+        item.declined = True
+        return True
+    banked = str(entry.get("answer", "") or "")
+    if not banked:
+        return False
+    if item.options:
+        matched = best_option(banked, item.options)
+        if matched is None:
+            UI.info(f"Your saved answer '{banked[:40]}' does not match the options here.")
+            return False
+        item.value = matched
+    else:
+        item.value = banked
+    item.source = "bank"
+    item.resolved = True
+    return True
 
 
 def resolve_planned_fields(planned: List[PlannedField], candidate: Dict[str, Any],
-                           job: Dict[str, Any], ai: "AIClient", app_id: Optional[str]) -> None:
-    """Fill the gaps: sensitive questions always go to the human, everything else may be
-    answered by the AI (only when it is confident and validated), otherwise by the human."""
+                           job: Dict[str, Any], app_id: Optional[str]) -> None:
+    """Fill the gaps without guessing. No model is involved anywhere in this path.
+
+    Resolution order:
+      1. deterministic profile mapping (already done by build_planned_fields)
+      2. the answer bank - an answer you typed on an earlier job in this batch
+      3. you
+
+    Sensitive/legal questions are answered only from a value you stored in your
+    own profile or one you type yourself. Anything you answer is written back to
+    the bank, so a 25-job batch asks you once, not 25 times.
+    """
     for item in planned:
         if item.resolved or item.kind == "file":
             continue
-        if item.sensitive:
-            UI.info(f"Sensitive question needs your input ({item.sensitive.replace('_', ' ')}).")
-            ask_human_for_field(item)
-        elif ai.available:
-            UI.info(f"Asking the AI about: {item.question[:80]}")
-            result = ai.answer_question(item.question, item.options, candidate, job)
-            if result:
-                item.value = result["answer"]
-                item.confidence = result["confidence"]
-                item.reason = result["reason"]
-                item.source, item.resolved = "ai", True
-                UI.ok(f"AI answer: {item.value} (confidence {item.confidence:.2f}) - {item.reason}")
+        if _apply_banked_answer(item, candidate):
+            if item.declined:
+                UI.info(f"Leaving '{item.question[:60]}' empty, as you chose earlier.")
             else:
-                UI.warn(f"AI could not answer this: {ai.last_error or 'no usable answer'}")
-                UI.print("    Candidate information is missing - please provide the answer.")
-                ask_human_for_field(item)
+                UI.info(f"Reusing your saved answer for '{item.question[:60]}': {item.value[:40]}")
+        elif item.sensitive:
+            UI.info(f"Sensitive question needs your input ({item.sensitive.replace('_', ' ')}).")
+            UI.print("    Legally consequential - answered only by you, never inferred.")
+            ask_human_for_field(item, candidate)
         else:
-            UI.info("AI is not configured, so this question goes to you.")
-            ask_human_for_field(item)
+            UI.info(f"No saved answer for: {item.question[:80]}")
+            UI.print("    Answer once and it is reused for the rest of this batch.")
+            ask_human_for_field(item, candidate)
         if item.resolved and app_id:
             store_answer(app_id, item.question, item.value, item.source, item.confidence)
 
@@ -3074,20 +3120,17 @@ def render_application_review(job: Dict[str, Any], planned: List[PlannedField],
             rows.append([item.question[:44], "(left empty)", "no answer"])
     UI.table(["Field / Question", "Value", "Source"], rows)
 
-    ai_items = [item for item in planned if item.source == "ai"]
-    if ai_items:
+    banked = [item for item in planned if item.source == "bank"]
+    if banked:
         UI.print("")
-        UI.print("AI Questions:")
-        for item in ai_items:
-            UI.print(f"  Question:   {item.question[:100]}")
-            UI.print(f"  Answer:     {item.value[:100]}")
-            confidence = f"{item.confidence:.2f}" if item.confidence is not None else "n/a"
-            UI.print(f"  Confidence: {confidence}  ({item.reason[:120]})")
-            UI.print("")
+        UI.print(f"Reused from your saved answers ({len(banked)}):")
+        for item in banked:
+            UI.print(f"  {item.question[:70]}  ->  {item.display_value[:60]}")
+        UI.print("")
 
     sensitive_items = [item for item in planned if item.sensitive]
     if sensitive_items:
-        UI.print("Sensitive / legal questions (never decided by the AI):")
+        UI.print("Sensitive / legal questions (answered only by you):")
         UI.table(["Question", "Answer", "Source", "Category"],
                  [[item.question[:40], item.display_value[:44] or "(no answer)",
                    item.source or "-", item.sensitive.replace("_", " ")] for item in sensitive_items])
@@ -3141,6 +3184,13 @@ def validate_required(controls: List[Dict[str, Any]], planned: List[PlannedField
 FIND_APPLY_JS = r"""
 () => {
   const textOf = (el) => (el ? (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() : '');
+  const hrefOf = (el) => {
+    if (!el) return '';
+    if (el.href) return String(el.href);
+    const anchor = el.closest ? el.closest('a[href]') : null;
+    if (anchor && anchor.href) return String(anchor.href);
+    try { return el.getAttribute('href') || ''; } catch (e) { return ''; }
+  };
   const buttons = Array.from(document.querySelectorAll('button, a[role="button"], a[data-testid*="apply" i]'));
   const visible = buttons.filter((b) => {
     const r = b.getBoundingClientRect();
@@ -3163,10 +3213,36 @@ FIND_APPLY_JS = r"""
   return {
     found: !!chosen,
     label: chosen ? textOf(chosen) : '',
+    href: hrefOf(chosen),
     text: (document.body ? document.body.innerText : '').slice(0, 4000),
     has_form: forms.length > 0,
     form_controls: formControls,
   };
+}
+"""
+
+FIND_NEXT_JS = r"""
+() => {
+  const textOf = (el) => (el ? (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() : '');
+  const buttons = Array.from(document.querySelectorAll(
+    'button, input[type=submit], input[type=button], a[role="button"]'));
+  const visible = buttons.filter((b) => {
+    const r = b.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && !b.disabled && b.getAttribute('aria-disabled') !== 'true';
+  });
+  const patterns = [/^(save and )?continue$/i, /^next$/i, /^next step$/i, /continue to next/i,
+                    /review and continue/i, /^proceed$/i, /^go on$/i, /^\u2192$/];
+  // Anything that actually submits, or walks backwards, is never a "next step".
+  const blocked = /submit|back|previous|cancel|save only/i;
+  for (const pattern of patterns) {
+    for (const b of visible) {
+      const label = textOf(b) || b.getAttribute('value') || '';
+      if (pattern.test(label) && label.length < 60 && !blocked.test(label)) {
+        return { found: true, label: label };
+      }
+    }
+  }
+  return { found: false, label: '' };
 }
 """
 
@@ -3232,6 +3308,20 @@ def find_submit_control(page) -> Dict[str, Any]:
     return info
 
 
+def find_next_control(page) -> Dict[str, Any]:
+    """Locate the Next / Continue control of a multi-step application wizard."""
+    try:
+        info = page.evaluate(FIND_NEXT_JS) or {}
+    except Exception as exc:
+        log_event("find_next_control", "warn", error=first_line(str(exc), 160))
+        info = {}
+    label = info.get("label") or ""
+    info["locator"] = _button_locator(page, label) if (info.get("found") and label) else None
+    if info.get("found") and info["locator"] is None:
+        info["found"] = False
+    return info
+
+
 CONFIRMATION_RE = re.compile(
     r"(application (has been )?(submitted|received|sent)|thank you for applying|"
     r"thanks for applying|we(?:'ve| have) received your application|"
@@ -3252,8 +3342,9 @@ def verify_submission(page) -> Tuple[bool, str]:
     return False, ""
 
 
-def run_easy_apply(config: Config, ai: AIClient, candidate: Dict[str, Any],
-                   job: Dict[str, Any], app_id: Optional[str] = None) -> str:
+def run_easy_apply(config: Config, candidate: Dict[str, Any],
+                   job: Dict[str, Any], app_id: Optional[str] = None,
+                   preauthorized: bool = False) -> str:
     """The whole controlled workflow (spec section 13). Returns the final state."""
     resume_path = Path(candidate["resume_file"]) if candidate.get("resume_file") else None
     if resume_path and not resume_path.exists():
@@ -3336,7 +3427,9 @@ def run_easy_apply(config: Config, ai: AIClient, candidate: Dict[str, Any],
 
             # --- apply entry point -------------------------------------------
             apply_info = find_apply_control(page)
-            page_type = classify_apply_label(apply_info.get("label", ""), apply_info.get("text", ""))
+            page_type = classify_apply_label(apply_info.get("label", ""),
+                                             apply_info.get("text", ""),
+                                             apply_info.get("href", ""))
             if page_type == AT_EXTERNAL:
                 job["application_type"] = AT_EXTERNAL
                 update_job(job)
@@ -3392,84 +3485,145 @@ def run_easy_apply(config: Config, ai: AIClient, candidate: Dict[str, Any],
                 job["application_type"] = AT_EASY_APPLY if page_type == AT_EASY_APPLY else AT_UNKNOWN
                 update_job(job)
 
-            # --- inspect ------------------------------------------------------
-            try:
-                page.wait_for_load_state("domcontentloaded")
-                page.wait_for_timeout(800)
-                controls, customs = inspect_page(page)
-            except Exception as exc:
-                UI.error("Could not inspect the application form: " + first_line(str(exc), 160))
-                screenshot(page, "inspect-failed")
-                set_state(app_id, ST_FAILED, error="form inspection failed")
-                return ST_FAILED
-
-            if not controls:
-                UI.print("")
-                UI.error("No supported form fields were found on the application page.")
-                UI.print("Possible causes:")
-                UI.print("  - the Easy Apply form did not load")
-                UI.print("  - this listing is applied for externally")
-                UI.print("  - the page uses widgets this MVP does not support")
-                UI.print("Nothing was submitted. Marked for human review.")
-                screenshot(page, "no-fields")
-                set_state(app_id, ST_REVIEW, error="no supported form fields detected",
-                          flags=["HUMAN_REVIEW_REQUIRED"])
-                return ST_REVIEW
-
+            # --- walk the wizard ----------------------------------------------
+            # Dice's Easy Apply flow lives at /job-applications/{id}/wizard and is
+            # multi-step, so inspect / resolve / fill / validate repeat until a
+            # submit control appears. Every step's answers are collected so that
+            # ONE review covers the whole application.
+            planned: List[PlannedField] = []
+            problems: List[str] = []
             unsupported: List[str] = []
-            for custom in customs:
-                unsupported.append(f"{custom.get('unsupported_reason', 'unsupported widget')}: "
-                                   f"{custom.get('label') or custom.get('kind') or 'unnamed'}")
-            supported_controls = []
-            for field in controls:
-                kind = normalize_kind(field.get("kind", "text"))
-                label = str(field.get("label") or field.get("name") or field.get("id") or "unnamed")[:60]
-                if kind in UNSUPPORTED_KINDS:
-                    unsupported.append(f"input type '{kind}' is not supported: {label}")
-                    continue
-                if kind not in ("text", "email", "phone", "textarea", "select", "radio",
-                                "checkbox", "file"):
-                    unsupported.append(f"unknown control type '{kind}': {label}")
-                    continue
-                supported_controls.append(field)
+            step = 0
+            while True:
+                step += 1
+                UI.info(f"Application step {step} (max {config.max_wizard_steps}).")
+                try:
+                    page.wait_for_load_state("domcontentloaded")
+                    page.wait_for_timeout(800)
+                    controls, customs = inspect_page(page)
+                except Exception as exc:
+                    UI.error("Could not inspect the application form: " + first_line(str(exc), 160))
+                    screenshot(page, f"inspect-failed-step{step}")
+                    set_state(app_id, ST_FAILED, error="form inspection failed")
+                    return ST_FAILED
 
-            if unsupported:
-                UI.print("")
-                UI.error("Unsupported application field detected.")
-                for item in unsupported:
-                    UI.print(f"    - {item}")
-                UI.print("Automation stopped. Nothing was submitted. This application needs a human.")
-                screenshot(page, "unsupported-fields")
-                set_state(app_id, ST_REVIEW,
-                          error="unsupported application field detected",
-                          flags=["HUMAN_REVIEW_REQUIRED"])
-                return ST_REVIEW
+                if detect_challenge(page):
+                    screenshot(page, f"challenge-step{step}")
+                    challenge_stop(job, app_id, f"filling application step {step}")
+                    return ST_REVIEW
 
-            attach_radio_options(supported_controls)
-            planned, problems = build_planned_fields(supported_controls, candidate, resume_path)
-            mapped = [item for item in planned if item.resolved and item.source != "ai"]
-            UI.info(f"{len(supported_controls)} supported control(s); {len(planned)} question(s)/field(s); "
-                    f"{len(mapped)} mapped directly from your profile.")
+                if not controls:
+                    UI.print("")
+                    UI.error("No supported form fields were found on the application page.")
+                    UI.print("Possible causes:")
+                    UI.print("  - the Easy Apply form did not load")
+                    UI.print("  - this listing is applied for externally")
+                    UI.print("  - the page uses widgets this MVP does not support")
+                    UI.print("Nothing was submitted. Marked for human review.")
+                    screenshot(page, f"no-fields-step{step}")
+                    set_state(app_id, ST_REVIEW, error="no supported form fields detected",
+                              flags=["HUMAN_REVIEW_REQUIRED"])
+                    return ST_REVIEW
 
-            # --- resolve the unknowns (AI only for non-sensitive semantic questions)
-            resolve_planned_fields(planned, candidate, job, ai, app_id)
+                for custom in customs:
+                    unsupported.append(f"{custom.get('unsupported_reason', 'unsupported widget')}: "
+                                       f"{custom.get('label') or custom.get('kind') or 'unnamed'}")
+                supported_controls = []
+                for field in controls:
+                    kind = normalize_kind(field.get("kind", "text"))
+                    label = str(field.get("label") or field.get("name") or field.get("id")
+                                or "unnamed")[:60]
+                    if kind in UNSUPPORTED_KINDS:
+                        unsupported.append(f"input type '{kind}' is not supported: {label}")
+                        continue
+                    if kind not in ("text", "email", "phone", "textarea", "select", "radio",
+                                    "checkbox", "file"):
+                        unsupported.append(f"unknown control type '{kind}': {label}")
+                        continue
+                    supported_controls.append(field)
 
-            # --- fill ---------------------------------------------------------
-            UI.info("Filling the form...")
-            problems += fill_planned_fields(page, planned)
-            try:
-                page.wait_for_timeout(1000)
-                page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                pass
+                if unsupported:
+                    UI.print("")
+                    UI.error("Unsupported application field detected.")
+                    for item in unsupported:
+                        UI.print(f"    - {item}")
+                    UI.print("Automation stopped. Nothing was submitted. This application needs a human.")
+                    screenshot(page, f"unsupported-fields-step{step}")
+                    set_state(app_id, ST_REVIEW,
+                              error="unsupported application field detected",
+                              flags=["HUMAN_REVIEW_REQUIRED"])
+                    return ST_REVIEW
 
-            # --- validate required fields -------------------------------------
-            try:
-                after_controls, _ = inspect_page(page)
-                attach_radio_options(after_controls)
-            except Exception:
-                after_controls = supported_controls
-            problems += validate_required(after_controls, planned)
+                attach_radio_options(supported_controls)
+                step_planned, step_problems = build_planned_fields(supported_controls, candidate,
+                                                                   resume_path)
+                mapped = [item for item in step_planned if item.resolved]
+                UI.info(f"Step {step}: {len(supported_controls)} control(s), "
+                        f"{len(step_planned)} question(s)/field(s), "
+                        f"{len(mapped)} answered from your profile or saved answers.")
+                planned.extend(step_planned)
+
+                # --- resolve the unknowns (profile -> answer bank -> you) -----
+                resolve_planned_fields(step_planned, candidate, job, app_id)
+
+                # --- fill ------------------------------------------------------
+                UI.info("Filling the form...")
+                step_problems += fill_planned_fields(page, step_planned)
+                try:
+                    page.wait_for_timeout(1000)
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+
+                # --- validate required fields ----------------------------------
+                try:
+                    after_controls, _ = inspect_page(page)
+                    attach_radio_options(after_controls)
+                except Exception:
+                    after_controls = supported_controls
+                step_problems += validate_required(after_controls, step_planned)
+                problems.extend(step_problems)
+
+                if problems:
+                    # Do not walk further with a broken step behind us.
+                    break
+
+                if find_submit_control(page).get("found"):
+                    UI.ok(f"Reached the final step at step {step}.")
+                    break
+
+                next_info = find_next_control(page)
+                if not next_info.get("found"):
+                    UI.print("")
+                    UI.error("No submit and no next/continue control was found on this step.")
+                    UI.print("The wizard may have changed, or this step needs something this tool")
+                    UI.print("cannot do. Nothing was submitted.")
+                    screenshot(page, f"no-next-step{step}")
+                    set_state(app_id, ST_REVIEW,
+                              error=f"no submit or next control on step {step}",
+                              flags=["HUMAN_REVIEW_REQUIRED"])
+                    return ST_REVIEW
+
+                if step >= config.max_wizard_steps:
+                    UI.print("")
+                    UI.error(f"The wizard did not finish within {config.max_wizard_steps} steps.")
+                    UI.print("Nothing was submitted. Raise MAX_WIZARD_STEPS if this form is longer.")
+                    screenshot(page, "wizard-too-long")
+                    set_state(app_id, ST_REVIEW, error="wizard exceeded MAX_WIZARD_STEPS",
+                              flags=["HUMAN_REVIEW_REQUIRED"])
+                    return ST_REVIEW
+
+                UI.info(f"Clicking \u201c{next_info.get('label')}\u201d for the next step...")
+                try:
+                    next_info["locator"].click(timeout=20000)
+                    page.wait_for_timeout(2000)
+                except Exception as exc:
+                    UI.error("The next/continue button could not be clicked: "
+                             + first_line(str(exc), 160))
+                    UI.print("Nothing was submitted.")
+                    screenshot(page, f"next-click-failed-step{step}")
+                    set_state(app_id, ST_FAILED, error="next step click failed")
+                    return ST_FAILED
 
             # --- review -------------------------------------------------------
             render_application_review(job, planned, problems, unsupported)
@@ -3492,13 +3646,16 @@ def run_easy_apply(config: Config, ai: AIClient, candidate: Dict[str, Any],
                 return ST_READY
 
             set_state(app_id, ST_READY, note="form filled, waiting for your confirmation")
-            UI.print("")
-            UI.print("Submit application?")
-            UI.print("Type YES to submit. Anything else cancels.")
-            if not UI.confirm_exact("Type YES to submit", expected="YES"):
-                UI.warn("Cancelled. Nothing was submitted.")
-                set_state(app_id, ST_CANCELLED, note="cancelled at the confirmation step")
-                return ST_CANCELLED
+            if preauthorized:
+                UI.info("Batch mode: you authorised this batch up front, so no per-job YES is asked.")
+            else:
+                UI.print("")
+                UI.print("Submit application?")
+                UI.print("Type YES to submit. Anything else cancels.")
+                if not UI.confirm_exact("Type YES to submit", expected="YES"):
+                    UI.warn("Cancelled. Nothing was submitted.")
+                    set_state(app_id, ST_CANCELLED, note="cancelled at the confirmation step")
+                    return ST_CANCELLED
 
             # --- the only place that can submit --------------------------------
             if detect_challenge(page):
@@ -3650,39 +3807,68 @@ def demo_jobs() -> List[Dict[str, Any]]:
 
 
 DEMO_FORM_HTML = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>JOBPILOT demo application form</title>
+<html lang="en"><head><meta charset="utf-8"><title>JOBPILOT demo application wizard</title>
 <style>body{font-family:Segoe UI,Arial,sans-serif;margin:32px;max-width:760px}
 label{display:block;margin:12px 0 4px;font-weight:600}small{color:#666}
 fieldset{margin:16px 0;border:1px solid #ccc;padding:12px}input[type=text],input[type=email],
-input[type=tel],textarea,select{width:100%;padding:6px;box-sizing:border-box}</style></head>
+input[type=tel],textarea,select{width:100%;padding:6px;box-sizing:border-box}
+.step{border-top:3px solid #0a7;padding-top:8px}h2{color:#0a7;font-size:1.05em}</style></head>
 <body>
-<h1>DEMO application form (local file, not Dice)</h1>
+<h1>DEMO application wizard (local file, not Dice)</h1>
 <p><small>Created only for <code>--demo</code> runs. It is a plain local HTML file and nothing
-here is sent anywhere.</small></p>
+here is sent anywhere. It is deliberately a <strong>two-step wizard</strong> so the multi-step
+engine that drives Dice's <code>/job-applications/{id}/wizard</code> can be exercised safely.</small></p>
 <form onsubmit="document.getElementById('out').textContent='demo: submission disabled';return false;">
-  <label for="firstName">First Name</label><input id="firstName" name="firstName" type="text" required>
-  <label for="lastName">Last Name</label><input id="lastName" name="lastName" type="text" required>
-  <label for="email">Email</label><input id="email" name="email" type="email" required>
-  <label for="phone">Phone</label><input id="phone" name="phone" type="tel">
-  <label for="location">Location</label><input id="location" name="location" type="text">
-  <label for="resume">Resume</label><input id="resume" name="resume" type="file" required>
-  <label for="years">Years of Experience</label>
-  <select id="years" name="years" required><option value="">Select</option>
-    <option>0-1</option><option>2-3</option><option>4-6</option><option>7+</option></select>
-  <fieldset><legend>Are you authorized to work in the country of this job?</legend>
-    <label><input type="radio" name="authorized" value="Yes" required> Yes</label>
-    <label><input type="radio" name="authorized" value="No"> No</label></fieldset>
-  <fieldset><legend>What is your highest level of education?</legend>
-    <label><input type="radio" name="education" value="Bachelors"> Bachelors</label>
-    <label><input type="radio" name="education" value="Masters"> Masters</label>
-    <label><input type="radio" name="education" value="Doctorate"> Doctorate</label></fieldset>
-  <label for="why">Why are you a good fit for this role?</label>
-  <textarea id="why" name="why" rows="3"></textarea>
-  <label><input type="checkbox" name="agree" value="agree" required> I agree the information is accurate</label>
-  <p><button type="submit">Submit Application</button>
-  <button type="button" id="cancel">Cancel</button></p>
+
+  <div id="step1" class="step">
+    <h2>Step 1 of 2 - Your details</h2>
+    <label for="firstName">First Name</label><input id="firstName" name="firstName" type="text" required>
+    <label for="lastName">Last Name</label><input id="lastName" name="lastName" type="text" required>
+    <label for="email">Email</label><input id="email" name="email" type="email" required>
+    <label for="phone">Phone</label><input id="phone" name="phone" type="tel">
+    <label for="location">Location</label><input id="location" name="location" type="text">
+    <label for="resume">Resume</label><input id="resume" name="resume" type="file" required>
+    <label for="years">Years of Experience</label>
+    <select id="years" name="years" required><option value="">Select</option>
+      <option>0-1</option><option>2-3</option><option>4-6</option><option>7+</option></select>
+    <p><button type="button" id="next1">Continue</button>
+    <button type="button" id="cancel1">Cancel</button></p>
+  </div>
+
+  <div id="step2" class="step" style="display:none">
+    <h2>Step 2 of 2 - Screening questions</h2>
+    <fieldset><legend>Are you authorized to work in the country of this job?</legend>
+      <label><input type="radio" name="authorized" value="Yes" required> Yes</label>
+      <label><input type="radio" name="authorized" value="No"> No</label></fieldset>
+    <fieldset><legend>What is your highest level of education?</legend>
+      <label><input type="radio" name="education" value="Bachelors"> Bachelors</label>
+      <label><input type="radio" name="education" value="Masters"> Masters</label>
+      <label><input type="radio" name="education" value="Doctorate"> Doctorate</label></fieldset>
+    <label for="cloud">Which cloud platform have you used most?</label>
+    <select id="cloud" name="cloud" required><option value="">Select</option>
+      <option>Amazon Web Services</option><option>Microsoft Azure</option>
+      <option>Google Cloud Platform</option><option>None of these</option></select>
+    <label for="notice">What is your notice period?</label>
+    <input id="notice" name="notice" type="text">
+    <label for="why">Why are you a good fit for this role?</label>
+    <textarea id="why" name="why" rows="3"></textarea>
+    <label><input type="checkbox" name="agree" value="agree" required> I agree the information is accurate</label>
+    <p><button type="button" id="back2">Back</button>
+    <button type="submit">Submit Application</button>
+    <button type="button" id="cancel2">Cancel</button></p>
+  </div>
+
 </form>
 <p id="out"></p>
+<script>
+  function show(one) {
+    document.getElementById('step1').style.display = one ? '' : 'none';
+    document.getElementById('step2').style.display = one ? 'none' : '';
+    window.scrollTo(0, 0);
+  }
+  document.getElementById('next1').addEventListener('click', function () { show(false); });
+  document.getElementById('back2').addEventListener('click', function () { show(true); });
+</script>
 </body></html>
 """
 
@@ -3728,11 +3914,13 @@ def menu_setup_candidate(config: Config) -> None:
                 ["Work authorization", candidate.get("work_authorization", "")],
                 ["Sponsorship required", candidate.get("sponsorship_required", "")],
                 ["Resume file", candidate.get("resume_file", "")],
+                ["Short pitch", clean_text(candidate.get("pitch", ""), 70)
+                                or "(not set - cover-letter boxes will ask you every time)"],
             ])
         else:
             UI.warn("No candidate profile yet.")
         options = ["Edit basic details (name, email, phone, location)",
-                   "Edit target roles, skills, experience, work modes",
+                   "Edit target roles, skills, experience, work modes, short pitch",
                    "Edit education, certifications, work experience, projects",
                    "Edit links (LinkedIn, GitHub, portfolio) and resume file",
                    "Edit work authorization / sponsorship / voluntary self-identification",
@@ -3762,6 +3950,14 @@ def menu_setup_candidate(config: Config) -> None:
                 employment = UI.ask("Preferred employment type (FULLTIME/CONTRACT/PARTTIME)",
                                     candidate.get("employment_type", "FULLTIME"))
                 candidate["employment_type"] = employment.upper()
+                UI.print("")
+                UI.print("Short pitch: one or two sentences about what you do and what you want.")
+                UI.print("It is used VERBATIM for cover-letter and 'why are you a good fit' boxes,")
+                UI.print("so a 25-job batch does not ask you the same question 25 times.")
+                UI.print("You write it - this program never generates prose.")
+                candidate["pitch"] = UI.ask("Short pitch (Enter to keep what you have)",
+                                            clean_text(candidate.get("pitch", ""), 500),
+                                            allow_empty=True)
             elif choice == 2:
                 candidate["education"] = UI.ask("Highest education (one line)",
                                                 clean_text(candidate.get("education", ""), 200))
@@ -4022,6 +4218,24 @@ def menu_search_jobs(config: Config) -> List[Dict[str, Any]]:
     return jobs
 
 
+def breakdown_line(breakdown: Dict[str, Any], score: Any) -> str:
+    """The components, plus the sum when it does not equal the rounded score.
+
+    Nothing about a score is hidden: if the parts add up to 92.5 and the score
+    shown is 93, the line says so instead of leaving you to find the difference.
+    """
+    if not breakdown:
+        return "-"
+    parts = ", ".join(f"{key}={value}" for key, value in breakdown.items())
+    try:
+        exact = round(sum(float(value) for value in breakdown.values()), 1)
+    except (TypeError, ValueError):
+        return parts
+    if score is None or float(score) != exact:
+        parts += f"   (sum={exact}, rounded to the score shown)"
+    return parts
+
+
 def render_job_detail(job: Dict[str, Any]) -> None:
     UI.table(["Field", "Value"], [
         ["Title", job.get("title", "")], ["Company", job.get("company", "")],
@@ -4030,10 +4244,8 @@ def render_job_detail(job: Dict[str, Any]) -> None:
         ["Posted", job.get("posted_date", "")], ["Apply type", job.get("application_type", "")],
         ["URL", job.get("source_url", "")], ["Score", job.get("score", "-")],
         ["Recommendation", job.get("recommendation", "-")],
-        ["AI adjustment", f"{job.get('ai_adjustment', 0):+d}".strip()
-                          + (" " + job["ai_reason"] if job.get("ai_reason") else "")],
         ["Skills", ", ".join(job.get("skills") or []) or "-"],
-        ["Score breakdown", ", ".join(f"{k}={v}" for k, v in (job.get("breakdown") or {}).items()) or "-"],
+        ["Score breakdown", breakdown_line(job.get("breakdown") or {}, job.get("score"))],
     ])
     if job.get("matches"):
         UI.print("MATCHES")
@@ -4049,8 +4261,9 @@ def render_job_detail(job: Dict[str, Any]) -> None:
 
 
 def menu_analyze_jobs(config: Config) -> None:
-    """Menu 4: deterministic scoring first, optional AI nudge, then save."""
-    UI.banner("Analyze jobs", "Deterministic score first - the AI can only nudge it, never decide.")
+    """Menu 4: deterministic scoring. Same formula for everyone, no model involved."""
+    UI.banner("Analyze jobs",
+              "Deterministic scoring only - no AI. Every point is explained in the breakdown.")
     candidate = load_candidate()
     if not candidate_has_profile(candidate):
         UI.warn("Create your candidate profile first (menu option 1).")
@@ -4060,41 +4273,20 @@ def menu_analyze_jobs(config: Config) -> None:
         UI.warn("No jobs in data/jobs.json yet. Run a search first (menu option 3).")
         return
 
-    ai = AIClient(config)
-    use_ai = False
-    if ai.available:
-        use_ai = bool(UI.ask_yes_no("Use AI for semantic matching as well?", default=True))
-    else:
-        UI.info("AI matching is off (no LLM_API_KEY configured). Deterministic scoring only.")
-
-    ai_calls = 0
     with UI.status("Scoring jobs ..."):
         for job in jobs:
             result = score_job(job, candidate)
-            if use_ai and ai_calls < 25:
-                verdict = ai.semantic_match(job, candidate, result)
-                ai_calls += 1
-                if verdict:
-                    result = apply_ai_adjustment(result, verdict["adjustment"],
-                                                 verdict["confidence"], verdict["reason"])
-                    log_event("ai_match", "ok", job_id=job.get("id"),
-                              extra={"adjustment": verdict["adjustment"]})
-                elif ai.last_error:
-                    log_event("ai_match", "warn", job_id=job.get("id"), error=ai.last_error)
             job.update({"score": result["score"], "breakdown": result["breakdown"],
                         "matches": result["matches"], "gaps": result["gaps"],
-                        "recommendation": result["recommendation"],
-                        "ai_adjustment": result.get("ai_adjustment", 0),
-                        "ai_reason": result.get("ai_reason", ""), "scored_at": now_iso()})
+                        "recommendation": result["recommendation"], "scored_at": now_iso()})
     save_jobs(jobs)
     log_event("score_jobs", "ok", extra={"count": len(jobs)})
 
     ordered = sorted(jobs, key=lambda item: item.get("score") or 0, reverse=True)
-    UI.table(["Score", "Rec", "Job", "Company", "Apply type", "AI nudge"],
+    UI.table(["Score", "Rec", "Job", "Company", "Apply type"],
              [[str(job.get("score", "-")), job.get("recommendation", "-"),
-               job.get("title", "")[:38], job.get("company", "")[:22],
-               job.get("application_type", AT_UNKNOWN),
-               (f"{job.get('ai_adjustment', 0):+d}" if job.get("ai_adjustment") else "-")]
+               job.get("title", "")[:42], job.get("company", "")[:26],
+               job.get("application_type", AT_UNKNOWN)]
               for job in ordered])
     apply_count = len([job for job in jobs if job.get("recommendation") == "APPLY"])
     UI.ok(f"Scored {len(jobs)} job(s). {apply_count} recommend APPLY "
@@ -4108,12 +4300,192 @@ def menu_analyze_jobs(config: Config) -> None:
             render_job_detail(ordered[index])
 
 
+def select_batch_jobs(jobs: List[Dict[str, Any]], limit: int, min_score: int = 0,
+                      easy_apply_only: bool = True,
+                      extra_schemes: Tuple[str, ...] = ()) -> List[Dict[str, Any]]:
+    """Pick which stored jobs a batch run will attempt.
+
+    Pure and deterministic so it can be unit-tested: Dice Easy Apply only, a real
+    http(s) URL, at or above ``min_score``, best score first, capped at ``limit``.
+    ``extra_schemes`` lets --demo include its local demo:// records.
+    """
+    allowed = ("http://", "https://") + tuple(extra_schemes)
+    eligible: List[Tuple[int, int, Dict[str, Any]]] = []
+    for position, job in enumerate(jobs or []):
+        if not isinstance(job, dict):
+            continue
+        if easy_apply_only and job.get("application_type") != AT_EASY_APPLY:
+            continue
+        url = str(job.get("source_url") or job.get("application_url") or "").lower()
+        if not url.startswith(allowed):
+            continue                      # excludes demo:// records and URL-less rows
+        try:
+            score = int(job.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        if score < min_score:
+            continue
+        eligible.append((score, position, job))
+    eligible.sort(key=lambda triple: (-triple[0], triple[1]))
+    return [job for _, _, job in eligible[:max(0, int(limit))]]
+
+
+def _latest_application_for(job_id: Any) -> Optional[Dict[str, Any]]:
+    matches = [app for app in load_applications() if app.get("job_id") == job_id]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda app: app.get("updated_at") or "")[-1]
+
+
+def menu_batch_apply(config: Config, candidate: Dict[str, Any]) -> None:
+    """Apply to a batch of Dice Easy Apply jobs, throttled, stopping safely."""
+    cap = max(1, min(config.batch_size, config.max_applications_per_run))
+    UI.banner("Batch apply",
+              f"Up to {cap} job{'' if cap == 1 else 's'}, throttled, never bypassing a security control.")
+    if cap < config.batch_size:
+        UI.warn(f"MAX_APPLICATIONS_PER_RUN={config.max_applications_per_run} in your .env caps this "
+                f"batch at {cap} job{'' if cap == 1 else 's'} (BATCH_SIZE={config.batch_size}).")
+        UI.print("    To apply to 20-30 jobs at once, set in .env:")
+        UI.print("        MAX_APPLICATIONS_PER_RUN=30")
+        UI.print("    then restart the program.")
+
+    jobs = load_jobs()
+    if not jobs:
+        UI.warn("No jobs stored. Run a search first (menu option 3).")
+        return
+    if not any(job.get("score") is not None for job in jobs):
+        UI.warn("None of your stored jobs are scored yet. Run menu option 4 (Analyze jobs) first.")
+        return
+
+    min_score = UI.ask_int("Minimum score to include (0-100)", 60, 0, 100)
+    if min_score is None:
+        return
+    selected = select_batch_jobs(jobs, cap, min_score,
+                                 extra_schemes=("demo://",) if config.demo else ())
+    if not selected:
+        UI.warn(f"No Dice Easy Apply job scores {min_score}+ with a usable URL.")
+        UI.print("    Lower the threshold, or run menu 4 to score more jobs.")
+        return
+
+    # Idempotency: never re-submit a job already recorded as SUBMITTED.
+    already = {app.get("job_id") for app in load_applications()
+               if app.get("state") == ST_SUBMITTED}
+    fresh = [job for job in selected if job.get("id") not in already]
+    dropped = len(selected) - len(fresh)
+    if dropped:
+        UI.info(f"{dropped} job(s) already recorded as SUBMITTED were left out.")
+    selected = fresh
+    if not selected:
+        UI.warn("Every selected job has already been submitted. Nothing to do.")
+        return
+
+    resume_path = Path(candidate["resume_file"]) if candidate.get("resume_file") else None
+    if resume_path and not resume_path.exists():
+        UI.warn(f"The stored CV is missing: {resume_path}")
+        resume_path = None
+    if resume_path:
+        UI.ok(f"Applying WITH CV: {resume_path.name}")
+    else:
+        UI.warn("No CV is set in your profile - applying WITHOUT a CV.")
+        UI.print("    Any job whose form requires a resume upload will stop at REVIEW_REQUIRED")
+        UI.print("    and will not be submitted. That is deliberate; nothing is guessed.")
+        if not UI.ask_yes_no("Continue without a CV?", default=True):
+            return
+
+    UI.table(["#", "Score", "Job", "Company", "Apply type"],
+             [[str(index), str(job.get("score", "-")), job.get("title", "")[:44],
+               job.get("company", "")[:26], job.get("application_type", "")]
+              for index, job in enumerate(selected, start=1)],
+             title=f"{len(selected)} job(s) queued")
+
+    UI.print("")
+    UI.print(f"This attempts {len(selected)} application(s) one after another, with roughly "
+             f"{int(config.batch_delay_seconds)}s between them.")
+    UI.print("A job that hits a CAPTCHA, an unsupported widget, or a question with no saved")
+    UI.print("answer is recorded for review and the batch moves on. A CAPTCHA stops everything.")
+    if config.batch_confirm:
+        if not UI.confirm_exact(f"Type YES to start the batch of {len(selected)}",
+                                expected="YES"):
+            UI.warn("Batch cancelled. Nothing was submitted.")
+            return
+
+    results: List[Tuple[Dict[str, Any], str]] = []
+    failures = 0
+    aborted = ""
+    demo_form = write_demo_form() if config.demo else None
+    if config.demo:
+        UI.warn("DEMO MODE: every job uses the local demo wizard and submission stays disabled.")
+    for index, job in enumerate(selected, start=1):
+        UI.print("")
+        UI.rule(f"Batch {index}/{len(selected)} - {job.get('title','')[:48]}")
+        run_job = job
+        if config.demo and demo_form is not None:
+            run_job = dict(job)
+            run_job["source_url"] = demo_form.as_uri()
+            run_job["application_url"] = run_job["source_url"]
+        try:
+            state = run_easy_apply(config, candidate, run_job, preauthorized=True)
+        except KeyboardInterrupt:
+            aborted = "interrupted by you"
+            UI.warn("Batch interrupted. The remaining jobs were not attempted.")
+            break
+        results.append((job, state))
+        failures = failures + 1 if state in (ST_FAILED, ST_REVIEW) else 0
+
+        record = _latest_application_for(job.get("id"))
+        if record and "SECURITY_CHALLENGE" in (record.get("flags") or []):
+            aborted = "Dice presented a security control"
+            UI.error("Stopping the whole batch: a CAPTCHA / MFA / bot check appeared.")
+            UI.print("This program never works around one. Sign in or solve it yourself,")
+            UI.print("then run the batch again - already-submitted jobs are skipped.")
+            break
+        if failures >= max(1, config.batch_stop_after_failures):
+            aborted = f"{failures} jobs in a row did not complete"
+            UI.error(f"Stopping the batch: {aborted}.")
+            UI.print("Something systemic is wrong (selectors, sign-in, or layout).")
+            break
+        if index < len(selected):
+            delay = max(0.0, config.batch_delay_seconds) * random.uniform(0.8, 1.3)
+            UI.info(f"Waiting {delay:.0f}s before the next job...")
+            time.sleep(delay)
+
+    counts: Dict[str, int] = {}
+    for _, state in results:
+        counts[state] = counts.get(state, 0) + 1
+    UI.print("")
+    UI.banner("Batch complete", f"{len(results)} of {len(selected)} attempted")
+    UI.table(["Job", "Company", "Final state"],
+             [[job.get("title", "")[:44], job.get("company", "")[:24], state]
+              for job, state in results])
+    if counts:
+        UI.print("Totals: " + ", ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+    if aborted:
+        UI.warn(f"Stopped early: {aborted}.")
+    review = [job for job, state in results if state == ST_REVIEW]
+    if review:
+        UI.print(f"{len(review)} job(s) need you: menu 6 (Application History) shows why.")
+    log_event("batch_apply", "ok" if not aborted else "stopped",
+              extra={"attempted": len(results), "submitted": counts.get(ST_SUBMITTED, 0),
+                     "review": counts.get(ST_REVIEW, 0), "failed": counts.get(ST_FAILED, 0),
+                     "aborted": aborted})
+
+
 def menu_apply(config: Config) -> None:
-    """Menu 5: pick a job and run the controlled Easy Apply workflow."""
+    """Menu 5: apply to one job, or run a throttled batch."""
     UI.banner("Apply to a job", "Dice Easy Apply only. Nothing is submitted without your YES.")
     candidate = load_candidate()
     if not candidate_has_profile(candidate):
         UI.warn("Create your candidate profile first (menu option 1).")
+        return
+    mode = UI.choose("What do you want to do?",
+                     ["Apply to ONE job (step by step, you type YES to submit)",
+                      f"Batch apply - up to "
+                      f"{max(1, min(config.batch_size, config.max_applications_per_run))} "
+                      f"job{'' if min(config.batch_size, config.max_applications_per_run) == 1 else 's'}"])
+    if mode is None:
+        return
+    if mode == 1:
+        menu_batch_apply(config, candidate)
         return
     if not candidate.get("resume_file"):
         UI.warn("No resume file is set in your profile. The flow can still run, but a required "
@@ -4198,7 +4570,7 @@ def menu_apply(config: Config) -> None:
         if not UI.ask_yes_no("Start the application workflow?", default=True):
             return
 
-    state = run_easy_apply(config, AIClient(config), candidate, job)
+    state = run_easy_apply(config, candidate, job)
     UI.print("")
     UI.print(f"Final state: {state}")
     if state == ST_SUBMITTED:
@@ -4334,19 +4706,18 @@ def menu_settings(config: Config) -> None:
             ["DICE_ALLOW_BROWSER_SEARCH", "on" if config.dice_allow_browser_search else "off"],
             ["DICE_MAX_RESULTS", str(config.dice_max_results)],
             ["DICE_ENRICH_LIMIT", str(config.dice_enrich_limit)],
-            ["LLM_API_KEY", masked(config.llm_api_key)],
-            ["LLM_BASE_URL", config.llm_base_url],
-            ["LLM_MODEL", config.llm_model],
-            ["LLM_ENABLED", "on" if config.llm_enabled else "off"],
-            ["AI_MIN_CONFIDENCE", str(config.ai_min_confidence)],
             ["BROWSER_HEADLESS", "on" if config.headless else "off"],
             ["REQUEST_TIMEOUT", f"{config.request_timeout}s"],
             ["NAV_TIMEOUT", f"{config.nav_timeout}s"],
             ["POLITE_DELAY_SECONDS", str(config.pol_request_delay)],
             ["MAX_APPLICATIONS_PER_RUN", str(config.max_applications_per_run)],
+            ["BATCH_SIZE", str(config.batch_size)],
+            ["BATCH_DELAY_SECONDS", f"{config.batch_delay_seconds}s (jittered)"],
+            ["BATCH_REQUIRE_CONFIRMATION", "on" if config.batch_confirm else "OFF - submits unattended"],
+            ["BATCH_STOP_AFTER_FAILURES", str(config.batch_stop_after_failures)],
+            ["MAX_WIZARD_STEPS", str(config.max_wizard_steps)],
         ])
         options = ["Set the Dice API key (official partner API)",
-                   "Set the LLM API key / model / base URL (AI features)",
                    "Turn browser search of the public Dice site on or off",
                    "Set browser headless mode",
                    "Sign in to Dice (opens a browser; you type the password)",
@@ -4362,33 +4733,22 @@ def menu_settings(config: Config) -> None:
             if value and update_env_file({"DICE_API_KEY": value}):
                 UI.ok("Dice API key saved to .env. It is never printed or logged.")
         elif choice == 1:
-            value = (getpass.getpass("LLM API key (hidden input): ").strip() if _tty()
-                     else UI.ask("LLM API key (visible: no TTY detected)", allow_empty=True))
-            updates = {}
-            if value:
-                updates["LLM_API_KEY"] = value
-            updates["LLM_BASE_URL"] = UI.ask("LLM base URL", config.llm_base_url)
-            updates["LLM_MODEL"] = UI.ask("LLM model", config.llm_model)
-            updates["LLM_ENABLED"] = "true" if UI.ask_yes_no("Enable AI features?", default=True) else "false"
-            if update_env_file(updates):
-                UI.ok("AI settings saved to .env.")
-        elif choice == 2:
             enabled = UI.ask_yes_no("Allow searching the public Dice site in a browser session?",
                                     default=config.dice_allow_browser_search)
             if enabled and not HAVE_PLAYWRIGHT:
                 UI.warn("Playwright is missing. Fix: pip install playwright && playwright install chromium")
             if update_env_file({"DICE_ALLOW_BROWSER_SEARCH": "true" if enabled else "false"}):
                 UI.ok("Setting saved.")
-        elif choice == 3:
+        elif choice == 2:
             headless = UI.ask_yes_no("Run the browser without a visible window (headless)?",
                                      default=False)
             if update_env_file({"BROWSER_HEADLESS": "true" if headless else "false"}):
                 UI.ok("Setting saved. Headless makes sign-in and reviews harder to follow.")
-        elif choice == 4:
+        elif choice == 3:
             sign_in_now(config)
-        elif choice == 5:
+        elif choice == 4:
             environment_report(config, deep=True)
-        elif choice == 6:
+        elif choice == 5:
             if BROWSER_STATE_FILE.exists() and UI.ask_yes_no(
                     "Delete the saved Dice session (data/browser_state.json)?", default=False):
                 try:
@@ -4396,7 +4756,7 @@ def menu_settings(config: Config) -> None:
                     UI.ok("Saved session deleted. You will sign in again next time.")
                 except OSError as exc:
                     UI.error(f"Could not delete the session file: {exc}")
-        elif choice == 7:
+        elif choice == 6:
             show_logs()
 
 

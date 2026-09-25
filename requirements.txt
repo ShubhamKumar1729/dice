@@ -3,9 +3,8 @@
 # Then:          playwright install chromium
 
 playwright>=1.40.0        # browser automation for the supported Dice Easy Apply workflow
-requests>=2.31.0          # official Dice partner API + LLM HTTP calls
+requests>=2.31.0          # official Dice partner API calls
 python-dotenv>=1.0.0      # reads .env (secrets stay out of the code)
-pydantic>=2.5.0           # validates AI JSON output before anything is used
 pypdf>=4.0.0              # PDF resume text extraction
 python-docx>=1.1.0        # DOCX resume parsing
 rich>=13.7.0              # clean terminal tables/panels/progress

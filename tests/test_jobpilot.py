@@ -4,7 +4,7 @@ JOBPILOT self-test. Run it after any change:
 
     python tests/test_jobpilot.py        (or: python -m pytest tests -q)
 
-It covers scoring, resume parsing, JSON storage, AI schema validation, deterministic
+It covers scoring, resume parsing, JSON storage, the answer bank, deterministic
 field mapping, safety guards, and the "no fake data" rules. No network access needed.
 """
 
@@ -128,7 +128,13 @@ def job_fixture(**overrides) -> dict:
 
 
 # ---------------------------------------------------------------------------
-class TestStorageAndSafety(unittest.TestCase):
+class TempStoreMixin:
+    """Point every JSON store at a throwaway directory for the duration of a test.
+
+    Without this, tests read and write the developer's real data/ folder, so the
+    suite fails on leftover demo jobs whenever the app was run first.
+    """
+
     def setUp(self):
         self._real = (jp.DATA_DIR, jp.UPLOADS_DIR, jp.ERRORS_DIR, jp.CANDIDATE_FILE,
                       jp.JOBS_FILE, jp.APPLICATIONS_FILE, jp.LOGS_FILE)
@@ -149,6 +155,8 @@ class TestStorageAndSafety(unittest.TestCase):
          jp.JOBS_FILE, jp.APPLICATIONS_FILE, jp.LOGS_FILE) = self._real
         jp._LOG_CACHE = self._log_cache
 
+
+class TestStorageAndSafety(TempStoreMixin, unittest.TestCase):
     def test_directories_are_created(self):
         self.assertTrue(jp.DATA_DIR.is_dir())
         self.assertTrue(jp.UPLOADS_DIR.is_dir())
@@ -235,15 +243,6 @@ class TestScoring(unittest.TestCase):
         self.assertIsInstance(result["score"], int)
         self.assertTrue(result["gaps"])
 
-    def test_ai_adjustment_is_clamped(self):
-        base = jp.score_job(job_fixture(), candidate_fixture())
-        raised = jp.apply_ai_adjustment(dict(base, breakdown=dict(base["breakdown"])), 999, 0.9, "x")
-        self.assertEqual(raised["ai_adjustment"], 10)
-        self.assertLessEqual(raised["score"], 100)
-        lowered = jp.apply_ai_adjustment(dict(base, breakdown=dict(base["breakdown"])), -999, 0.9, "x")
-        self.assertEqual(lowered["ai_adjustment"], -10)
-        self.assertGreaterEqual(lowered["score"], 0)
-
     def test_sponsorship_conflict_is_penalised(self):
         candidate = candidate_fixture()
         candidate["sponsorship_required"] = "yes"
@@ -307,7 +306,7 @@ class TestResumeParsing(unittest.TestCase):
             self.assertIn(key, parsed["confidence"])
 
 
-class TestNoFakeData(unittest.TestCase):
+class TestNoFakeData(TempStoreMixin, unittest.TestCase):
     def test_availability_message_when_nothing_is_configured(self):
         config = jp.Config()
         provider = jp.DiceProvider(config)
@@ -348,8 +347,47 @@ class TestNoFakeData(unittest.TestCase):
         self.assertEqual(jp.classify_apply_label("Easy Apply"), jp.AT_EASY_APPLY)
         self.assertEqual(jp.classify_apply_label("Apply on Company Site"), jp.AT_EXTERNAL)
         self.assertEqual(jp.classify_apply_label("", "apply on company website"), jp.AT_EXTERNAL)
-        self.assertEqual(jp.classify_apply_label("Apply Now"), jp.AT_EXTERNAL)
         self.assertEqual(jp.classify_apply_label("Something else", "nothing here"), jp.AT_UNKNOWN)
+
+    def test_dice_apply_now_button_is_not_misread_as_external(self):
+        """Regression: Dice's real Easy Apply button is labelled "Apply Now".
+
+        It used to be classified EXTERNAL_APPLICATION, which made menu 5 refuse
+        every Dice Easy Apply job. A bare label is now UNKNOWN, and the wizard
+        href is what proves Dice hosts the form.
+        """
+        self.assertEqual(jp.classify_apply_label("Apply Now"), jp.AT_UNKNOWN)
+        signed_out = ("https://www.dice.com/dashboard/login?redirectUrl="
+                      "%2Fjob-applications%2F3fd53cce-03b9-47af-825c-4ef74b984763%2Fwizard")
+        self.assertEqual(jp.classify_apply_label("Apply Now", "", signed_out), jp.AT_EASY_APPLY)
+        signed_in = "https://www.dice.com/job-applications/3fd53cce-03b9/wizard"
+        self.assertEqual(jp.classify_apply_label("Apply", "", signed_in), jp.AT_EASY_APPLY)
+        offsite = "https://careers.example.com/jobs/1234/apply"
+        self.assertEqual(jp.classify_apply_label("Apply Now", "", offsite), jp.AT_EXTERNAL)
+
+    def test_wizard_job_id_extraction(self):
+        signed_out = ("https://www.dice.com/dashboard/login?redirectUrl="
+                      "%2Fjob-applications%2Fabc-123%2Fwizard")
+        self.assertEqual(jp.dice_wizard_job_id(signed_out), "abc-123")
+        self.assertEqual(jp.dice_wizard_job_id("https://www.dice.com/job-applications/xyz/wizard"),
+                         "xyz")
+        self.assertEqual(jp.dice_wizard_job_id("https://careers.example.com/apply"), "")
+        self.assertEqual(jp.dice_wizard_job_id(""), "")
+        self.assertEqual(jp.dice_wizard_url("abc-123"),
+                         "https://www.dice.com/job-applications/abc-123/wizard")
+
+    def test_employment_type_is_canonicalised(self):
+        for raw, expected in (("Full-time", "FULLTIME"), ("FULL_TIME", "FULLTIME"),
+                              ("Contract W2", "CONTRACT"), ("Part-time", "PARTTIME"),
+                              ("Third Party", "THIRD_PARTY")):
+            self.assertEqual(jp.normalize_employment_type(raw), expected, raw)
+        self.assertEqual(jp.normalize_employment_type(""), "")
+        # A full-time contract role keeps both signals.
+        self.assertEqual(jp.normalize_employment_type("Full-time, Contract"),
+                         "FULLTIME, CONTRACT")
+        # And normalize_job applies it, so scoring compares like with like.
+        job = jp.normalize_job({"id": "x", "title": "Dev", "employment_type": "Full-time"})
+        self.assertEqual(job["employment_type"], "FULLTIME")
 
     def test_unsupported_kinds_are_rejected(self):
         for kind in ("date", "number", "url", "password", "range", "color", "search"):
@@ -358,7 +396,7 @@ class TestNoFakeData(unittest.TestCase):
         self.assertEqual(jp.normalize_kind("select-one"), "select")
 
 
-class TestFieldMappingAndQuestions(unittest.TestCase):
+class TestFieldMappingAndQuestions(TempStoreMixin, unittest.TestCase):
     def test_deterministic_mapping(self):
         candidate = candidate_fixture()
         self.assertEqual(jp.match_known_field(jp.normalize_field_text(
@@ -394,70 +432,142 @@ class TestFieldMappingAndQuestions(unittest.TestCase):
                                         ["Bachelors", "Masters", "Doctorate"]), "Bachelors")
         self.assertEqual(jp.best_option("", ["Yes", "No"]), None)
 
-    def test_sensitive_question_is_not_answered_by_ai(self):
-        """The AI must never be asked a sensitive question."""
-        class FakeAI:
-            available = True
-            last_error = ""
-            called = []
+    def test_skill_specific_years_question_is_not_filled_from_total_years(self):
+        """'Years with Kubernetes?' must never be answered with your TOTAL years."""
+        generic = ["How many years of experience do you have?", "Total experience",
+                   "Years of relevant experience", "total years of professional experience"]
+        specific = ["How many years of experience do you have with Kubernetes?",
+                    "Years of experience with Python and Django?",
+                    "How many years have you used AWS?", "Years of React experience?"]
+        for text in generic:
+            self.assertEqual(jp.match_known_field(jp.normalize_field_text({"label": text})),
+                             "years_experience", text)
+        for text in specific:
+            self.assertNotEqual(jp.match_known_field(jp.normalize_field_text({"label": text})),
+                                "years_experience", text)
+        self.assertEqual(jp.named_technology("years with Kubernetes"), "kubernetes")
+        self.assertIsNone(jp.named_technology("how many years of experience do you have"))
 
-            def answer_question(self, question, options, candidate, job):
-                FakeAI.called.append(question)
-                return {"answer": "Yes", "confidence": 0.99, "reason": "guess"}
+    def test_free_text_experience_boxes_are_not_filled_with_a_number(self):
+        """'Describe your experience' is not a years question - '6' would be nonsense."""
+        for text in ("Describe your professional experience",
+                     "Please summarise your work experience",
+                     "What experience do you bring to this role?"):
+            self.assertNotEqual(jp.match_known_field(jp.normalize_field_text({"label": text})),
+                                "years_experience", text)
 
-        planned = [
-            jp.PlannedField(field={}, question="Are you authorized to work in the US?",
-                            kind="radio", options=["Yes", "No"], sensitive="work_authorization"),
-            jp.PlannedField(field={}, question="Why do you want this job?",
-                            kind="textarea", options=[]),
-        ]
-        answers: list = []
+    def test_an_unmatched_years_question_falls_through_to_the_answer_bank(self):
+        candidate = candidate_fixture()
+        question = "How many years of experience do you have with Kubernetes?"
+        jp.bank_store(candidate, question, "3", "human")
+        controls = [{"kind": "text", "label": question, "name": "k8s_years",
+                     "state_key": "0", "index": 0}]
+        planned, problems = jp.build_planned_fields(controls, candidate, None)
+        jp.resolve_planned_fields(planned, candidate, job_fixture(), None)
+        self.assertEqual(planned[0].value, "3")       # your answer, not your total years
+        self.assertEqual(planned[0].source, "bank")
+        self.assertNotEqual(str(planned[0].value), str(candidate.get("years_experience")))
+
+    def test_sensitive_question_is_answered_only_by_you(self):
+        """Nothing is banked yet, so a legal question is routed to a human prompt."""
+        candidate = candidate_fixture()
+        question = "Are you authorized to work in the US?"
+        item = jp.PlannedField(field={}, question=question, kind="radio",
+                               options=["Yes", "No"], sensitive="work_authorization")
+        asked = []
+
+        def fake_human(target, cand=None):
+            asked.append(target.question)
+            target.value, target.source, target.resolved = "Yes", "human", True
+
         original = jp.ask_human_for_field
-        jp.ask_human_for_field = lambda item: (item.__setattr__("value", "Yes"),
-                                               item.__setattr__("resolved", True),
-                                               answers.append(item.question))
+        jp.ask_human_for_field = fake_human
         try:
-            jp.resolve_planned_fields(planned, candidate_fixture(), job_fixture(), FakeAI(), None)
+            jp.resolve_planned_fields([item], candidate, job_fixture(), None)
         finally:
             jp.ask_human_for_field = original
-        self.assertEqual(FakeAI.called, ["Why do you want this job?"])
-        self.assertIn("Are you authorized to work in the US?", answers)
+        self.assertEqual(asked, [question])
+        self.assertEqual(item.source, "human")      # answered by you, never inferred
 
-    def test_unmapped_ai_option_is_rejected(self):
-        client = jp.AIClient(jp.Config(llm_api_key="test-key", llm_enabled=True))
-        self.assertTrue(client.available)
-        client._post = lambda payload: {"answer": "Maybe later", "confidence": 0.99,
-                                        "reason": "unsure"}
-        result = client.answer_question("Are you willing to relocate?", ["Yes", "No"],
-                                        candidate_fixture(), job_fixture())
-        self.assertIsNone(result)
-        self.assertTrue(client.last_error)
+    def test_your_own_sensitive_answer_is_reused_across_the_batch(self):
+        """You typed it on job 1, so job 17 reuses YOUR answer instead of asking again."""
+        candidate = candidate_fixture()
+        question = "Will you now or in the future require sponsorship?"
+        jp.bank_store(candidate, question, "No", "human")
+        item = jp.PlannedField(field={}, question=question, kind="radio",
+                               options=["Yes", "No"], sensitive="sponsorship")
+        jp.resolve_planned_fields([item], candidate, job_fixture(), None)
+        self.assertTrue(item.resolved)
+        self.assertEqual(item.value, "No")
+        self.assertEqual(item.source, "bank")
 
-        # an off-list answer that matches exactly one option is normalised
-        client._post = lambda payload: {"answer": "yes", "confidence": 0.99, "reason": "profile"}
-        result = client.answer_question("Are you willing to relocate?", ["Yes", "No"],
-                                       candidate_fixture(), job_fixture())
-        self.assertEqual(result["answer"], "Yes")
+    def test_declining_once_is_remembered_as_leave_it_empty(self):
+        """A skipped question is not asked 25 more times, and is never guessed either."""
+        candidate = candidate_fixture()
+        question = "LinkedIn profile URL"
+        self.assertTrue(jp.bank_decline(candidate, question))
 
-    def test_low_confidence_and_unknown_answers_are_rejected(self):
-        client = jp.AIClient(jp.Config(llm_api_key="test-key", llm_enabled=True,
-                                       ai_min_confidence=0.75))
-        client._post = lambda payload: {"answer": "Yes", "confidence": 0.10, "reason": "guessing"}
-        self.assertIsNone(client.answer_question("Relocate?", ["Yes", "No"],
-                                                candidate_fixture(), job_fixture()))
-        client._post = lambda payload: {"answer": "UNKNOWN", "confidence": 0.99, "reason": "missing"}
-        self.assertIsNone(client.answer_question("Relocate?", ["Yes", "No"],
-                                                candidate_fixture(), job_fixture()))
-        client._post = lambda payload: "not json"
-        self.assertIsNone(client.answer_question("Relocate?", ["Yes", "No"],
-                                                candidate_fixture(), job_fixture()))
+        item = jp.PlannedField(field={}, question=question, kind="text")
+        self.assertTrue(jp._apply_banked_answer(item, candidate))
+        self.assertTrue(item.declined)
+        self.assertFalse(item.resolved)         # stays empty
+        self.assertEqual(item.value, "")
 
-    def test_ai_disabled_without_key(self):
-        client = jp.AIClient(jp.Config())
-        self.assertFalse(client.available)
-        self.assertIsNone(client.answer_question("Q", [], candidate_fixture(), job_fixture()))
-        self.assertIsNone(client.semantic_match(job_fixture(), candidate_fixture(),
-                                                jp.score_job(job_fixture(), candidate_fixture())))
+        asked = []
+        original = jp.ask_human_for_field
+        jp.ask_human_for_field = lambda target, cand=None: asked.append(target.question)
+        try:
+            fresh = jp.PlannedField(field={}, question=question, kind="text")
+            jp.resolve_planned_fields([fresh], candidate, job_fixture(), None)
+        finally:
+            jp.ask_human_for_field = original
+        self.assertEqual(asked, [])             # not re-asked on the next job
+        self.assertFalse(fresh.resolved)
+
+    def test_answering_at_the_prompt_banks_the_answer(self):
+        candidate = candidate_fixture()
+        question = "How many years of experience do you have with Kubernetes?"
+        item = jp.PlannedField(field={}, question=question, kind="text")
+        prompts = []
+        original = jp.UI.ask
+        jp.UI.ask = lambda prompt, default="", allow_empty=False: (prompts.append(prompt), "6")[1]
+        try:
+            jp.ask_human_for_field(item, candidate)
+        finally:
+            jp.UI.ask = original
+        self.assertEqual(len(prompts), 1)
+        self.assertTrue(item.resolved)
+        self.assertEqual(item.value, "6")
+        self.assertEqual(item.source, "human")
+        self.assertEqual(jp.bank_lookup(candidate, question), "6")   # reused on the next job
+
+    def test_pressing_enter_at_the_prompt_banks_the_decline(self):
+        candidate = candidate_fixture()
+        question = "Portfolio website"
+        item = jp.PlannedField(field={}, question=question, kind="text")
+        original = jp.UI.ask
+        jp.UI.ask = lambda prompt, default="", allow_empty=False: ""   # you skip it
+        try:
+            jp.ask_human_for_field(item, candidate)
+        finally:
+            jp.UI.ask = original
+        self.assertFalse(item.resolved)
+        self.assertEqual(item.source, "missing")
+        self.assertTrue(jp.bank_entry(candidate, question)["declined"])
+
+    def test_picking_an_option_by_number_banks_the_exact_option_text(self):
+        candidate = candidate_fixture()
+        question = "Are you willing to relocate?"
+        item = jp.PlannedField(field={}, question=question, kind="radio",
+                               options=["Yes", "No", "Open to it"])
+        original = jp.UI.ask
+        jp.UI.ask = lambda prompt, default="", allow_empty=False: "3"   # menu number
+        try:
+            jp.ask_human_for_field(item, candidate)
+        finally:
+            jp.UI.ask = original
+        self.assertEqual(item.value, "Open to it")     # exact page text, not "3"
+        self.assertEqual(jp.bank_lookup(candidate, question), "Open to it")
 
     def test_build_planned_fields_maps_profile_values(self):
         controls = [
@@ -516,6 +626,193 @@ class TestResumeImportToProfile(unittest.TestCase):
         found = jp.extract_requirements(description)
         self.assertIn("Python", found)
         self.assertNotIn("Health insurance", found)
+
+
+class TestBatchApply(TempStoreMixin, unittest.TestCase):
+    """Batch apply (20-30 jobs at once) with no LLM involved."""
+
+    def test_selection_filters_and_orders(self):
+        jobs = [
+            {"id": "a", "title": "Low", "application_type": jp.AT_EASY_APPLY,
+             "source_url": "https://www.dice.com/job-detail/a", "score": 55},
+            {"id": "b", "title": "High", "application_type": jp.AT_EASY_APPLY,
+             "source_url": "https://www.dice.com/job-detail/b", "score": 92},
+            {"id": "c", "title": "External", "application_type": jp.AT_EXTERNAL,
+             "source_url": "https://careers.example.com/1", "score": 99},
+            {"id": "d", "title": "Demo", "application_type": jp.AT_EASY_APPLY,
+             "source_url": "demo://local/demo-form", "score": 99},
+            {"id": "e", "title": "Mid", "application_type": jp.AT_EASY_APPLY,
+             "source_url": "https://www.dice.com/job-detail/e", "score": 71},
+        ]
+        picked = [job["id"] for job in jp.select_batch_jobs(jobs, 25, 60)]
+        self.assertEqual(picked, ["b", "e"])          # external + demo excluded, best first
+        self.assertEqual([job["id"] for job in jp.select_batch_jobs(jobs, 1, 0)], ["b"])
+        self.assertEqual(jp.select_batch_jobs(jobs, 25, 95), [])
+        self.assertEqual(jp.select_batch_jobs([], 25, 0), [])
+
+    def test_unscored_jobs_are_not_silently_zero(self):
+        jobs = [{"id": "a", "application_type": jp.AT_EASY_APPLY,
+                 "source_url": "https://www.dice.com/job-detail/a", "score": None}]
+        self.assertEqual(jp.select_batch_jobs(jobs, 25, 1), [])
+        self.assertEqual([j["id"] for j in jp.select_batch_jobs(jobs, 25, 0)], ["a"])
+
+    def test_answer_bank_roundtrip(self):
+        candidate = dict(jp.CANDIDATE_DEFAULTS)
+        jp.save_candidate(candidate)
+        question = "How many years of experience do you have with Python?"
+        self.assertEqual(jp.bank_lookup(candidate, question), "")
+        self.assertTrue(jp.bank_store(candidate, question, "6 years", "human"))
+        # Reloaded from disk, and matched case/punctuation-insensitively.
+        reloaded = jp.load_candidate()
+        self.assertEqual(jp.bank_lookup(reloaded, question), "6 years")
+        self.assertEqual(jp.bank_lookup(reloaded, "how many YEARS of experience do you have with python??"),
+                         "6 years")
+        self.assertFalse(jp.bank_store(candidate, question, "", "human"))
+
+    def test_banked_answer_must_fit_the_options(self):
+        candidate = dict(jp.CANDIDATE_DEFAULTS)
+        candidate["answer_bank"] = {jp.answer_bank_key("Do you have an MBA?"): {"answer": "No"}}
+        item = jp.PlannedField(field={}, question="Do you have an MBA?", kind="radio",
+                               options=["Yes", "No"])
+        self.assertTrue(jp._apply_banked_answer(item, candidate))
+        self.assertEqual(item.value, "No")
+        self.assertEqual(item.source, "bank")
+        # A saved answer that matches none of this page's options is refused.
+        other = jp.PlannedField(field={}, question="Do you have an MBA?", kind="radio",
+                                options=["Yes, from a US school", "Yes, from another country"])
+        self.assertFalse(jp._apply_banked_answer(other, candidate))
+        self.assertFalse(other.resolved)
+
+    def test_pitch_answers_cover_letter_boxes(self):
+        candidate = dict(jp.CANDIDATE_DEFAULTS)
+        candidate["pitch"] = "I build reliable Python services."
+        self.assertEqual(jp.deterministic_value("cover_letter", candidate),
+                         "I build reliable Python services.")
+        self.assertEqual(jp.deterministic_value("cover_letter", {}), "")
+        self.assertEqual(jp.match_known_field("why do you want this job"), "cover_letter")
+
+    def test_batch_config_defaults(self):
+        config = jp.Config()
+        self.assertEqual(config.batch_size, 25)
+        self.assertTrue(config.batch_confirm)            # one typed YES per batch by default
+        self.assertGreaterEqual(config.max_applications_per_run, 30)
+        self.assertEqual(config.max_wizard_steps, 8)
+
+    def test_wizard_step_detection_never_matches_submit(self):
+        self.assertIn("blocked = /submit", jp.FIND_NEXT_JS)
+        self.assertIn("/job-applications/", jp.DICE_WIZARD_PATH)
+        self.assertTrue(callable(jp.find_next_control))
+
+    def test_the_second_job_in_a_batch_asks_you_nothing(self):
+        """The core batch promise: answer a question once, never on jobs 2..N."""
+        candidate = dict(jp.CANDIDATE_DEFAULTS)
+        candidate.update({"first_name": "Jane", "last_name": "Doe",
+                          "email": "jane.doe@example.com", "phone": "+1 555 0100",
+                          "location": "Austin, TX", "years_experience": 6})
+        jp.save_candidate(candidate)
+
+        def wizard_controls():
+            return [
+                {"kind": "text", "label": "First Name", "name": "firstName",
+                 "state_key": "0", "index": 0},
+                {"kind": "text", "label": "How many years of experience do you have with Kubernetes?",
+                 "state_key": "1", "index": 1},
+                {"kind": "text", "label": "Why are you a good fit for this role?",
+                 "state_key": "2", "index": 2},
+                {"kind": "text", "label": "Portfolio website", "name": "portfolio",
+                 "state_key": "3", "index": 3},
+            ]
+
+        replies = iter(["3", "I ship reliable Python services.", "skip"])
+        asked = []
+        original = jp.UI.ask
+        jp.UI.ask = lambda prompt, default="", allow_empty=False: (asked.append(prompt),
+                                                                   next(replies))[1]
+        try:
+            first, problems = jp.build_planned_fields(wizard_controls(), candidate, None)
+            jp.resolve_planned_fields(first, candidate, job_fixture(), None)
+        finally:
+            jp.UI.ask = original
+        self.assertEqual(len(asked), 3)          # job 1: three questions, name came from profile
+        job1 = {item.question: item for item in first}
+        self.assertEqual(job1["First Name"].source, "profile")
+        self.assertEqual(job1["How many years of experience do you have with Kubernetes?"].value, "3")
+        self.assertEqual(job1["Why are you a good fit for this role?"].value,
+                         "I ship reliable Python services.")
+
+        # Job 2 shows the identical wizard: nothing may be asked again.
+        def refuse(prompt, default="", allow_empty=False):
+            raise AssertionError(f"job 2 asked the human: {prompt}")
+
+        jp.UI.ask = refuse
+        try:
+            second, problems = jp.build_planned_fields(wizard_controls(), candidate, None)
+            jp.resolve_planned_fields(second, candidate, job_fixture(), None)
+        finally:
+            jp.UI.ask = original
+        job2 = {item.question: item for item in second}
+        self.assertEqual(job2["First Name"].value, "Jane")                     # from profile
+        k8s = job2["How many years of experience do you have with Kubernetes?"]
+        self.assertEqual(k8s.value, "3")                                       # from the bank
+        self.assertEqual(k8s.source, "bank")
+        self.assertNotEqual(k8s.value, "6")                    # NOT your total years of experience
+        self.assertEqual(job2["Why are you a good fit for this role?"].value,
+                         "I ship reliable Python services.")
+        self.assertTrue(job2["Portfolio website"].declined)     # remembered skip, left empty
+        self.assertFalse(job2["Portfolio website"].resolved)
+
+    def test_exhausted_input_is_never_saved_as_a_decline(self):
+        """A closed stdin looks like 'skip'; banking it would poison every later job."""
+        candidate = dict(jp.CANDIDATE_DEFAULTS)
+        jp.save_candidate(candidate)
+        question = "Do you have an active security clearance?"
+        item = jp.PlannedField(field={}, question=question, kind="text")
+        saved = jp.UI.eof_seen
+        jp.UI.eof_seen = True
+        try:
+            jp.ask_human_for_field(item, candidate)
+        finally:
+            jp.UI.eof_seen = saved
+        self.assertFalse(item.resolved)
+        self.assertEqual(item.value, "")
+        self.assertIsNone(jp.bank_entry(candidate, question))   # nothing was recorded
+        self.assertIsNone(jp.load_candidate().get("answer_bank", {}).get(
+            jp.answer_bank_key(question)))                      # ... and nothing was saved
+
+    def test_an_explicit_skip_is_saved_as_a_decline(self):
+        candidate = dict(jp.CANDIDATE_DEFAULTS)
+        jp.save_candidate(candidate)
+        question = "Do you have an MBA?"
+        item = jp.PlannedField(field={}, question=question, kind="text")
+        original = jp.UI.ask
+        jp.UI.ask = lambda prompt, default="", allow_empty=False: "skip"
+        try:
+            jp.ask_human_for_field(item, candidate)
+        finally:
+            jp.UI.ask = original
+        self.assertTrue(jp.bank_entry(candidate, question)["declined"])
+        self.assertTrue(jp.bank_entry(jp.load_candidate(), question)["declined"])
+
+    def test_score_is_the_half_up_rounding_of_its_parts(self):
+        result = jp.score_job(job_fixture(), candidate_fixture())
+        exact = round(sum(float(v) for v in result["breakdown"].values()), 1)
+        self.assertEqual(result["score"], int(exact + 0.5))    # 92.5 -> 93, not banker's 92
+        self.assertLessEqual(abs(exact - result["score"]), 0.5)
+
+    def test_a_rounding_difference_is_disclosed_not_hidden(self):
+        self.assertIn("sum=92.5", jp.breakdown_line({"role": 27.5, "skills": 65.0}, 93))
+        self.assertNotIn("sum=", jp.breakdown_line({"role": 30.0, "skills": 63.0}, 93))
+        self.assertEqual(jp.breakdown_line({}, None), "-")
+        self.assertEqual(jp.breakdown_line({"role": "bad"}, None), "role=bad")
+
+    def test_security_challenge_flag_stops_a_batch(self):
+        job = jp.normalize_job({"id": "j1", "title": "Dev",
+                                "source_url": "https://www.dice.com/job-detail/j1"})
+        app = jp.create_application(job)
+        jp.challenge_stop(job, app["id"], "test")
+        record = jp._latest_application_for("j1")
+        self.assertIn("SECURITY_CHALLENGE", record["flags"])
+        self.assertEqual(record["state"], jp.ST_REVIEW)
 
 
 if __name__ == "__main__":
